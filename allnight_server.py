@@ -377,25 +377,22 @@ async def set_levels(p: LevelsPayload):
     return {"ok": True}
 
 
-@app.post("/execute/{sig_id}")
-async def execute(sig_id: str):
+@app.get("/execute/{sig_id}")
+async def execute_get(sig_id: str):
     ok, reason = stats.can_trade()
-    if not ok: return {"success": False, "reason": reason}
+    if not ok:
+        return {"success": False, "reason": reason}
     sig = next((s for s in signals if s["id"] == sig_id), None)
-    if not sig: return {"success": False, "reason": "Signal not found"}
+    if not sig:
+        return {"success": False, "reason": "Signal not found or expired"}
     success, body = await fire_webhook(sig)
     if success:
         signals[:] = [s for s in signals if s["id"] != sig_id]
-        trades.insert(0, {**sig, "status": "EXECUTED",
-                          "executed_at": datetime.now(EST).strftime("%H:%M:%S")})
-        await broadcast({"type": "executed", "sig_id": sig_id, "stats": stats.status()})
-        await send_telegram(
-            f"✅ *Order fired* — {sig['inst']} {sig['direction']}\n"
-            f"Entry: `{sig['entry']:,.2f}` | Stop: `{sig['stop']:,.2f}` | TP1: `{sig['tp1']:,.2f}`\n"
-            f"Session: {sig['session']} | {sig['contracts']} contracts"
-        )
-        return {"success": True, "sig": sig}
-    return {"success": False, "reason": f"Webhook failed: {body}"}
+        trades.insert(0, {**sig, "status": "EXECUTED", "executed_at": datetime.now(EST).strftime("%H:%M:%S")})
+        await send_telegram(f"✅ *Order fired* — {sig['inst']} {sig['direction']} @ `{sig['entry']:,.2f}`")
+        return {"success": True, "message": "Order executed successfully"}
+    else:
+        return {"success": False, "reason": f"Webhook failed: {body}"}"}
 
 
 @app.post("/dismiss/{sig_id}")
