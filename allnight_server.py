@@ -392,7 +392,7 @@ async def execute_get(sig_id: str):
         await send_telegram(f"✅ *Order fired* — {sig['inst']} {sig['direction']} @ `{sig['entry']:,.2f}`")
         return {"success": True, "message": "Order executed successfully"}
     else:
-        return {"success": False, "reason": f"Webhook failed: {body}"}"}
+        return {"success": False, "reason": "Webhook failed"}
 
 
 @app.post("/dismiss/{sig_id}")
