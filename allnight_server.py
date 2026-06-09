@@ -215,7 +215,6 @@ async def send_telegram(msg, keyboard=None):
     except Exception as e:
         logger.warning(f"Telegram error: {e}")
 
-
 async def fire_webhook(sig):
     payload = {
         "symbol":                sig["inst"],
@@ -243,6 +242,8 @@ async def fire_webhook(sig):
             }
         ],
     }
+    headers = {
+        "Content-Type": "application/json",
         "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
         "Origin": "https://www.pickmytrade.trade",
         "Referer": "https://www.pickmytrade.trade/",
@@ -256,9 +257,6 @@ async def fire_webhook(sig):
     except Exception as e:
         logger.error(f"fire_webhook error: {e}")
         return False, str(e)
-
-
-
 async def broadcast(data):
     dead = []
     for ws in ws_clients:
