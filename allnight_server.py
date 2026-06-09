@@ -1,9 +1,9 @@
-import asyncio, os, json, logging, urllib.request
+import asyncio, os, json, logging
 from contextlib import asynccontextmanager
 from datetime import datetime, date, time, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -24,9 +24,8 @@ MAX_DAY_PROFIT = 1500
 
 # Bot 2 instruments — MICRO contracts, 5 each
 INSTRUMENTS = {
-    "MES": {"yf": "ES=F", "pmt": "MES", "point_value": 5.0,  "stop_pts": 10, "contracts": 5, "name": "Micro E-mini S&P"},
-    "MNQ": {"yf": "NQ=F", "pmt": "MNQ", "point_value": 2.0,  "stop_pts": 20, "contracts": 5, "name": "Micro E-mini Nasdaq"},
-}
+   "MES": {"pmt": "MES", "point_value": 5.0,  "stop_pts": 10, "contracts": 5, "name": "Micro E-mini S&P"},
+"MNQ": {"pmt": "MNQ", "point_value": 2.0,  "stop_pts": 20, "contracts": 5, "name": "Micro E-mini Nasdaq"},}
 
 # All three sessions
 SESSIONS = {
@@ -246,23 +245,7 @@ async def fire_webhook(sig):
         return False, str(e)
 
 
-def fetch_price_sync(symbol):
-    req = urllib.request.Request(
-        f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1m&range=1d",
-        headers={"User-Agent": "Mozilla/5.0"}
-    )
-    with urllib.request.urlopen(req, timeout=5) as r:
-        d = json.loads(r.read())
-        return float(d["chart"]["result"][0]["meta"]["regularMarketPrice"])
 
-
-async def fetch_price(symbol):
-    loop = asyncio.get_event_loop()
-    try:
-        return await loop.run_in_executor(None, fetch_price_sync, symbol)
-    except Exception as e:
-        logger.warning(f"Price failed {symbol}: {e}")
-        return None
 
 
 async def broadcast(data):
@@ -281,7 +264,7 @@ async def price_loop():
         try:
             for inst, cfg in INSTRUMENTS.items():
                 try:
-                    price = await fetch_price(cfg["yf"])
+                    price = prices.get(inst)
                     if price:
                         prices[inst] = price
                         logger.info(f"{inst}: {price}")
@@ -424,6 +407,19 @@ async def reset_day():
     stats.day_date = date.today()
     signals.clear()
     return {"ok": True}
+    @app.post("/price-update")
+async def price_update(request: Request):
+    try:
+        data = await request.json()
+        symbol = data.get("symbol", "").upper()
+        price = float(data.get("price", 0))
+        if symbol and price:
+            prices[symbol] = price
+            logger.info(f"TradingView price: {symbol} = {price}")
+        return {"ok": True}
+    except Exception as e:
+        logger.error(f"Price update error: {e}")
+        return {"ok": False}
 
 
 @app.websocket("/ws")
