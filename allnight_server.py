@@ -4,7 +4,6 @@ from datetime import datetime, date, time, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -237,15 +236,21 @@ async def fire_webhook(sig):
         "order_type":          "MKT",
         "account_id":          PMT_ACCOUNT,
     }
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
+        "Origin": "https://www.pickmytrade.trade",
+        "Referer": "https://www.pickmytrade.trade/",
+    }
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.post(PMT_URL, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as r:
+            async with s.post(PMT_URL, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as r:
                 body = await r.text()
+                logger.info(f"PMT response: {r.status} {body}")
                 return r.status == 200, body
     except Exception as e:
+        logger.error(f"fire_webhook error: {e}")
         return False, str(e)
-
-
 
 
 
@@ -361,65 +366,22 @@ async def set_levels(p: LevelsPayload):
     return {"ok": True}
 
 
-@app.get("/execute/{sig_id}", response_class=HTMLResponse)
+@app.get("/execute/{sig_id}")
 async def execute_get(sig_id: str):
     ok, reason = stats.can_trade()
     if not ok:
-        return HTMLResponse(f"<h2>❌ {reason}</h2>")
+        return {"success": False, "reason": reason}
     sig = next((s for s in signals if s["id"] == sig_id), None)
     if not sig:
-        return HTMLResponse("<h2>⏰ Signal expired</h2>")
-    payload = {
-        "symbol": sig["inst"],
-        "date": datetime.utcnow().isoformat(),
-        "data": "buy" if sig["direction"] == "LONG" else "sell",
-        "quantity": sig["contracts"],
-        "risk_percentage": 0,
-        "price": sig["entry"],
-        "dollar_tp": sig["dollar_tp"],
-        "dollar_sl": sig["dollar_sl"],
-        "tp": 0, "percentage_tp": 0,
-        "sl": 0, "percentage_sl": 0,
-        "trail": 0, "trail_stop": 0, "trail_trigger": 0, "trail_freq": 0,
-        "update_tp": False, "update_sl": False, "breakeven": 0,
-        "token": PMT_TOKEN,
-        "pyramid": False,
-        "reverse_order_close": True,
-        "order_type": "MKT",
-        "account_id": PMT_ACCOUNT,
-    }
-    payload_json = json.dumps(payload)
-    confirm_url = f"https://alphagrid-allnight-production.up.railway.app/confirm/{sig_id}"
-    html = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>body{{background:#000;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;flex-direction:column;gap:16px}}
-h2{{font-size:1.4rem;text-align:center}}p{{color:#aaa;font-size:.9rem}}</style></head>
-<body>
-<h2 id="msg">⏳ Firing order...</h2>
-<p id="sub">{sig["inst"]} {sig["direction"]} @ {sig["entry"]}</p>
-<script>
-fetch("https://api.pickmytrade.trade/v2/add-trade-data",{{
-  method:"POST",headers:{{"Content-Type":"application/json"}},
-  body:JSON.stringify({payload_json})
-}}).then(r=>r.text()).then(t=>{{
-  fetch("{confirm_url}",{{method:"POST"}});
-  document.getElementById("msg").innerText="✅ Order Fired!";
-  document.getElementById("sub").innerText=t;
-}}).catch(e=>{{
-  document.getElementById("msg").innerText="❌ Failed";
-  document.getElementById("sub").innerText=e.toString();
-}});
-</script></body></html>"""
-    return HTMLResponse(html)
-
-@app.post("/confirm/{sig_id}")
-async def confirm_executed(sig_id: str):
-    sig = next((s for s in signals if s["id"] == sig_id), None)
-    if sig:
+        return {"success": False, "reason": "Signal not found or expired"}
+    success, body = await fire_webhook(sig)
+    if success:
         signals[:] = [s for s in signals if s["id"] != sig_id]
         trades.insert(0, {**sig, "status": "EXECUTED", "executed_at": datetime.now(EST).strftime("%H:%M:%S")})
         await send_telegram(f"✅ *Order fired* — {sig['inst']} {sig['direction']} @ `{sig['entry']:,.2f}`")
-    return {"ok": True}
+        return {"success": True, "message": "Order executed successfully"}
+    else:
+        return {"success": False, "reason": "Webhook failed"}
 
 
 @app.post("/dismiss/{sig_id}")
