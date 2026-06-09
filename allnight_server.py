@@ -238,7 +238,7 @@ async def fire_webhook(sig):
                 "token":               PMT_TOKEN,
                 "account_id":          "MFFUEVRPD505461063",
                 "risk_percentage":     0,
-                "quantity_multiplier": 5,
+                "quantity_multiplier": 1,
             }
         ],
     }
