@@ -407,7 +407,7 @@ async def reset_day():
     stats.day_date = date.today()
     signals.clear()
     return {"ok": True}
-    @app.post("/price-update")
+@app.post("/price-update")
 async def price_update(request: Request):
     try:
         data = await request.json()
