@@ -404,7 +404,8 @@ async def price_loop():
                             asyncio.create_task(send_telegram(msg, kb))
                         await broadcast({
                             "type": "price", "inst": inst, "price": price,
-                            "signals": signals, "stats": stats.status(),
+                            "signals": signals, "trades": trades,
+                            "stats": stats.status(),
                             "phase": get_phase(), "session": get_active_session()[0],
                         })
                 except Exception as e:
@@ -443,7 +444,8 @@ async def health():
 @app.get("/state")
 async def get_state():
     sess_key, _ = get_active_session()
-    return {"prices": prices, "signals": signals, "session_levels": session_levels,
+    return {"prices": prices, "signals": signals, "trades": trades,
+            "session_levels": session_levels,
             "phase": get_phase(), "session": sess_key, **stats.status()}
 
 
@@ -484,6 +486,7 @@ async def execute_get(sig_id: str):
     if success:
         signals[:] = [s for s in signals if s["id"] != sig_id]
         trades.insert(0, {**sig, "status": "EXECUTED", "executed_at": datetime.now(EST).strftime("%H:%M:%S")})
+        await broadcast({"type": "trade_executed", "trades": trades, "signals": signals, "stats": stats.status()})
         await send_telegram(f"✅ *Order fired* — {sig['inst']} {sig['direction']} @ `{sig['entry']:,.2f}`")
         return {"success": True, "message": "Order executed successfully"}
     else:
