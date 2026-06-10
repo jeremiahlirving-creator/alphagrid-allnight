@@ -22,10 +22,17 @@ MAX_DRAWDOWN   = -1800
 PROFIT_TARGET  = 3000
 MAX_DAY_PROFIT = 1500
 
+# ── KILL SWITCH CONFIG ────────────────────────────────────────────────────────
+MODE               = os.getenv("MODE", "EVAL")          # EVAL or FUNDED
+DAILY_CAP_LIMIT    = float(os.getenv("DAILY_CAP_LIMIT", "2500"))   # max day profit before pause
+TRAILING_DD_LIMIT  = float(os.getenv("TRAILING_DD_LIMIT", "500"))  # max pullback from peak day pnl
+LOSS_STREAK_LIMIT  = int(os.getenv("LOSS_STREAK_LIMIT", "3"))      # consecutive losses before pause
+
 # Bot 2 instruments — MICRO contracts, 5 each
 INSTRUMENTS = {
-   "MES": {"pmt": "MES", "point_value": 5.0,  "stop_pts": 10, "contracts": 5, "name": "Micro E-mini S&P"},
-"MNQ": {"pmt": "MNQ", "point_value": 2.0,  "stop_pts": 20, "contracts": 5, "name": "Micro E-mini Nasdaq"},}
+    "MES": {"pmt": "MES", "point_value": 5.0,  "stop_pts": 10, "contracts": 5, "name": "Micro E-mini S&P"},
+    "MNQ": {"pmt": "MNQ", "point_value": 2.0,  "stop_pts": 20, "contracts": 5, "name": "Micro E-mini Nasdaq"},
+}
 
 # All three sessions
 SESSIONS = {
@@ -57,32 +64,110 @@ session_levels = {
 
 class PropStats:
     def __init__(self):
-        self.total_pnl = 0.0
-        self.day_pnl   = 0.0
-        self.day_date  = date.today()
-        self.trades    = 0
-        self.wins      = 0
-        self.losses    = 0
-        self.locked    = False
-        self.revenge_until = None
+        self.total_pnl      = 0.0
+        self.day_pnl        = 0.0
+        self.peak_day_pnl   = 0.0
+        self.day_date       = date.today()
+        self.trades         = 0
+        self.wins           = 0
+        self.losses         = 0
+        self.loss_streak    = 0
+        self.locked         = False
+        self.revenge_until  = None
+        # kill switch flags
+        self.ks_daily_cap   = False
+        self.ks_trailing_dd = False
+        self.ks_loss_streak = False
+        self.ks_reversal    = False
 
     def new_day(self):
         if date.today() != self.day_date:
-            self.day_pnl  = 0.0
-            self.day_date = date.today()
+            self.day_pnl        = 0.0
+            self.peak_day_pnl   = 0.0
+            self.day_date       = date.today()
+            self.loss_streak    = 0
+            # reset intraday kill switches each new day
+            self.ks_daily_cap   = False
+            self.ks_trailing_dd = False
+            self.ks_loss_streak = False
+            self.ks_reversal    = False
 
     def record(self, pnl):
         self.new_day()
         self.total_pnl += pnl
         self.day_pnl   += pnl
         self.trades    += 1
-        if pnl > 0: self.wins += 1
+
+        if pnl > 0:
+            self.wins        += 1
+            self.loss_streak  = 0
         else:
-            self.losses += 1
+            self.losses      += 1
+            self.loss_streak += 1
             self.revenge_until = datetime.utcnow() + timedelta(minutes=30)
+
+        # update peak day pnl
+        if self.day_pnl > self.peak_day_pnl:
+            self.peak_day_pnl = self.day_pnl
+
+        # evaluate kill switches
+        self._eval_kill_switches()
+
         if self.total_pnl <= MAX_DRAWDOWN:
             self.locked = True
+
         return self.locked
+
+    def _eval_kill_switches(self):
+        # 1. Daily cap — prevent consistency rule breach
+        if self.day_pnl >= DAILY_CAP_LIMIT:
+            if not self.ks_daily_cap:
+                self.ks_daily_cap = True
+                asyncio.create_task(send_telegram(
+                    f"🛑 *KILL SWITCH — Daily Cap*\n"
+                    f"Day P&L `${self.day_pnl:.0f}` hit cap of `${DAILY_CAP_LIMIT:.0f}`\n"
+                    f"Bot paused for rest of day to protect consistency rule."
+                ))
+
+        # 2. Trailing drawdown from peak
+        drawdown_from_peak = self.peak_day_pnl - self.day_pnl
+        if self.peak_day_pnl > 0 and drawdown_from_peak >= TRAILING_DD_LIMIT:
+            if not self.ks_trailing_dd:
+                self.ks_trailing_dd = True
+                asyncio.create_task(send_telegram(
+                    f"🛑 *KILL SWITCH — Trailing Drawdown*\n"
+                    f"Pulled back `${drawdown_from_peak:.0f}` from peak of `${self.peak_day_pnl:.0f}`\n"
+                    f"Bot paused to protect gains."
+                ))
+
+        # 3. Loss streak
+        if self.loss_streak >= LOSS_STREAK_LIMIT:
+            if not self.ks_loss_streak:
+                self.ks_loss_streak = True
+                asyncio.create_task(send_telegram(
+                    f"🛑 *KILL SWITCH — Loss Streak*\n"
+                    f"`{self.loss_streak}` consecutive losses\n"
+                    f"Bot paused — market conditions unfavorable."
+                ))
+
+    def trigger_reversal(self):
+        """Manually trigger reversal kill switch (e.g. from dashboard)."""
+        if not self.ks_reversal:
+            self.ks_reversal = True
+            asyncio.create_task(send_telegram(
+                "🛑 *KILL SWITCH — Reversal Detected*\n"
+                "Manual reversal trigger fired.\n"
+                "Bot paused."
+            ))
+
+    def reset_kill_switches(self):
+        self.ks_daily_cap   = False
+        self.ks_trailing_dd = False
+        self.ks_loss_streak = False
+        self.ks_reversal    = False
+
+    def any_kill_switch(self):
+        return self.ks_daily_cap or self.ks_trailing_dd or self.ks_loss_streak or self.ks_reversal
 
     def can_trade(self):
         self.new_day()
@@ -91,6 +176,10 @@ class PropStats:
         if self.day_pnl   >= MAX_DAY_PROFIT: return False, "Daily consistency limit"
         if self.revenge_until and datetime.utcnow() < self.revenge_until:
             return False, "Revenge trade cooldown"
+        if self.ks_daily_cap:   return False, "Kill switch: daily cap"
+        if self.ks_trailing_dd: return False, "Kill switch: trailing drawdown"
+        if self.ks_loss_streak: return False, "Kill switch: loss streak"
+        if self.ks_reversal:    return False, "Kill switch: reversal"
         return True, "OK"
 
     def status(self):
@@ -98,19 +187,32 @@ class PropStats:
         mins_left = 0
         if self.revenge_until and datetime.utcnow() < self.revenge_until:
             mins_left = int((self.revenge_until - datetime.utcnow()).total_seconds() / 60)
+        drawdown_from_peak = round(self.peak_day_pnl - self.day_pnl, 2)
         return {
-            "total_pnl":    round(self.total_pnl, 2),
-            "day_pnl":      round(self.day_pnl, 2),
-            "trades":       self.trades,
-            "wins":         self.wins,
-            "losses":       self.losses,
-            "win_rate":     round(self.wins / self.trades * 100, 1) if self.trades else 0,
-            "locked":       self.locked,
-            "can_trade":    ok,
-            "reason":       reason,
-            "revenge_mins": mins_left,
-            "to_target":    round(PROFIT_TARGET - self.total_pnl, 2),
-            "drawdown_used": round(abs(min(0, self.total_pnl)) / abs(MAX_DRAWDOWN) * 100, 1),
+            "total_pnl":         round(self.total_pnl, 2),
+            "day_pnl":           round(self.day_pnl, 2),
+            "peak_day_pnl":      round(self.peak_day_pnl, 2),
+            "drawdown_from_peak": drawdown_from_peak,
+            "loss_streak":       self.loss_streak,
+            "trades":            self.trades,
+            "wins":              self.wins,
+            "losses":            self.losses,
+            "win_rate":          round(self.wins / self.trades * 100, 1) if self.trades else 0,
+            "locked":            self.locked,
+            "can_trade":         ok,
+            "reason":            reason,
+            "revenge_mins":      mins_left,
+            "to_target":         round(PROFIT_TARGET - self.total_pnl, 2),
+            "drawdown_used":     round(abs(min(0, self.total_pnl)) / abs(MAX_DRAWDOWN) * 100, 1),
+            "kill_switches": {
+                "daily_cap":   self.ks_daily_cap,
+                "trailing_dd": self.ks_trailing_dd,
+                "loss_streak": self.ks_loss_streak,
+                "reversal":    self.ks_reversal,
+            },
+            "mode":              MODE,
+            "daily_cap_limit":   int(DAILY_CAP_LIMIT),
+            "trailing_dd_limit": int(TRAILING_DD_LIMIT),
         }
 
 
@@ -257,6 +359,7 @@ async def fire_webhook(sig):
     except Exception as e:
         logger.error(f"fire_webhook error: {e}")
         return False, str(e)
+
 async def broadcast(data):
     dead = []
     for ws in ws_clients:
@@ -319,7 +422,7 @@ async def lifespan(app):
         "🌙 *All Night Bot online*\n"
         "Watching *MES + MNQ* — 5 contracts each\n"
         "🟡 Asia · 🔵 London · 🟢 NY Kill Zone\n"
-        "Prop firm rules active · $50K account"
+        "Prop firm rules active · Kill switches armed · $50K account"
     )
     yield
     task.cancel()
@@ -412,10 +515,27 @@ async def record_result(p: ResultPayload):
 
 @app.post("/reset_day")
 async def reset_day():
-    stats.day_pnl = 0.0
-    stats.day_date = date.today()
+    stats.day_pnl       = 0.0
+    stats.peak_day_pnl  = 0.0
+    stats.day_date      = date.today()
+    stats.loss_streak   = 0
+    stats.reset_kill_switches()
     signals.clear()
     return {"ok": True}
+
+
+@app.post("/reset_kill_switches")
+async def reset_kill_switches():
+    stats.reset_kill_switches()
+    return {"ok": True, "kill_switches": stats.status()["kill_switches"]}
+
+
+@app.post("/trigger_reversal")
+async def trigger_reversal():
+    stats.trigger_reversal()
+    return {"ok": True, "reason": "Reversal kill switch triggered"}
+
+
 @app.post("/price-update")
 async def price_update(request: Request):
     try:
