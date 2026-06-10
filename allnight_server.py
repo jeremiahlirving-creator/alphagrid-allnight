@@ -41,7 +41,7 @@ SESSIONS = {
     "ny":     {"name": "NY Kill Zone", "start": time(8, 0),   "end": time(10, 30), "emoji": "🟢"},
 }
 
-PMT_URL     = os.getenv("PMT_WEBHOOK_URL", "https://api.pickmytrade.trade/v2/add-trade-data")
+PMT_URL     = os.getenv("PMT_WEBHOOK_URL", "https://api.pickmytrade.trade/v2/add-trade-data-latest?t=18504")
 PMT_TOKEN   = os.getenv("PMT_TOKEN", "")
 PMT_ACCOUNT = os.getenv("PMT_ACCOUNT_ID", "")
 TG_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN", "")
