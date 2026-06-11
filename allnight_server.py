@@ -23,10 +23,10 @@ PROFIT_TARGET  = 3000
 MAX_DAY_PROFIT = 1500
 
 # ── KILL SWITCH CONFIG ────────────────────────────────────────────────────────
-MODE               = os.getenv("MODE", "EVAL")
-DAILY_CAP_LIMIT    = float(os.getenv("DAILY_CAP_LIMIT", "2500"))
-TRAILING_DD_LIMIT  = float(os.getenv("TRAILING_DD_LIMIT", "500"))
-LOSS_STREAK_LIMIT  = int(os.getenv("LOSS_STREAK_LIMIT", "3"))
+MODE               = os.getenv("MODE", "EVAL")          # EVAL or FUNDED
+DAILY_CAP_LIMIT    = float(os.getenv("DAILY_CAP_LIMIT", "2500"))   # max day profit before pause
+TRAILING_DD_LIMIT  = float(os.getenv("TRAILING_DD_LIMIT", "500"))  # max pullback from peak day pnl
+LOSS_STREAK_LIMIT  = int(os.getenv("LOSS_STREAK_LIMIT", "3"))      # consecutive losses before pause
 
 # Bot 2 instruments — MICRO contracts, 5 each
 INSTRUMENTS = {
@@ -41,7 +41,7 @@ SESSIONS = {
     "ny":     {"name": "NY Kill Zone", "start": time(8, 0),   "end": time(10, 30), "emoji": "🟢"},
 }
 
-PMT_URL     = os.getenv("PMT_WEBHOOK_URL", "https://api.pickmytrade.trade/v2/add-trade-data-latest?t=18504")
+PMT_URL     = os.getenv("PMT_WEBHOOK_URL", "https://api.pickmytrade.trade/v2/add-trade-data")
 PMT_TOKEN   = os.getenv("PMT_TOKEN", "")
 PMT_ACCOUNT = os.getenv("PMT_ACCOUNT_ID", "")
 TG_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -74,9 +74,11 @@ class PropStats:
         self.loss_streak    = 0
         self.locked         = False
         self.revenge_until  = None
+        # kill switch flags
         self.ks_daily_cap   = False
         self.ks_trailing_dd = False
         self.ks_loss_streak = False
+        self.ks_reversal    = False
 
     def new_day(self):
         if date.today() != self.day_date:
@@ -84,9 +86,11 @@ class PropStats:
             self.peak_day_pnl   = 0.0
             self.day_date       = date.today()
             self.loss_streak    = 0
+            # reset intraday kill switches each new day
             self.ks_daily_cap   = False
             self.ks_trailing_dd = False
             self.ks_loss_streak = False
+            self.ks_reversal    = False
 
     def record(self, pnl):
         self.new_day()
@@ -102,9 +106,11 @@ class PropStats:
             self.loss_streak += 1
             self.revenge_until = datetime.utcnow() + timedelta(minutes=30)
 
+        # update peak day pnl
         if self.day_pnl > self.peak_day_pnl:
             self.peak_day_pnl = self.day_pnl
 
+        # evaluate kill switches
         self._eval_kill_switches()
 
         if self.total_pnl <= MAX_DRAWDOWN:
@@ -113,6 +119,7 @@ class PropStats:
         return self.locked
 
     def _eval_kill_switches(self):
+        # 1. Daily cap — prevent consistency rule breach
         if self.day_pnl >= DAILY_CAP_LIMIT:
             if not self.ks_daily_cap:
                 self.ks_daily_cap = True
@@ -122,6 +129,7 @@ class PropStats:
                     f"Bot paused for rest of day to protect consistency rule."
                 ))
 
+        # 2. Trailing drawdown from peak
         drawdown_from_peak = self.peak_day_pnl - self.day_pnl
         if self.peak_day_pnl > 0 and drawdown_from_peak >= TRAILING_DD_LIMIT:
             if not self.ks_trailing_dd:
@@ -132,6 +140,7 @@ class PropStats:
                     f"Bot paused to protect gains."
                 ))
 
+        # 3. Loss streak
         if self.loss_streak >= LOSS_STREAK_LIMIT:
             if not self.ks_loss_streak:
                 self.ks_loss_streak = True
@@ -141,13 +150,24 @@ class PropStats:
                     f"Bot paused — market conditions unfavorable."
                 ))
 
+    def trigger_reversal(self):
+        """Manually trigger reversal kill switch (e.g. from dashboard)."""
+        if not self.ks_reversal:
+            self.ks_reversal = True
+            asyncio.create_task(send_telegram(
+                "🛑 *KILL SWITCH — Reversal Detected*\n"
+                "Manual reversal trigger fired.\n"
+                "Bot paused."
+            ))
+
     def reset_kill_switches(self):
         self.ks_daily_cap   = False
         self.ks_trailing_dd = False
         self.ks_loss_streak = False
+        self.ks_reversal    = False
 
     def any_kill_switch(self):
-        return self.ks_daily_cap or self.ks_trailing_dd or self.ks_loss_streak
+        return self.ks_daily_cap or self.ks_trailing_dd or self.ks_loss_streak or self.ks_reversal
 
     def can_trade(self):
         self.new_day()
@@ -159,6 +179,7 @@ class PropStats:
         if self.ks_daily_cap:   return False, "Kill switch: daily cap"
         if self.ks_trailing_dd: return False, "Kill switch: trailing drawdown"
         if self.ks_loss_streak: return False, "Kill switch: loss streak"
+        if self.ks_reversal:    return False, "Kill switch: reversal"
         return True, "OK"
 
     def status(self):
@@ -187,6 +208,7 @@ class PropStats:
                 "daily_cap":   self.ks_daily_cap,
                 "trailing_dd": self.ks_trailing_dd,
                 "loss_streak": self.ks_loss_streak,
+                "reversal":    self.ks_reversal,
             },
             "mode":              MODE,
             "daily_cap_limit":   int(DAILY_CAP_LIMIT),
@@ -505,10 +527,47 @@ async def reset_day():
     return {"ok": True}
 
 
+@app.get("/reset_day")
+async def reset_day_get():
+    stats.day_pnl       = 0.0
+    stats.peak_day_pnl  = 0.0
+    stats.day_date      = date.today()
+    stats.loss_streak   = 0
+    stats.reset_kill_switches()
+    signals.clear()
+    return {"ok": True, "message": "Day reset — kill switches cleared"}
+
+
+@app.get("/reset_killswitches")
+async def reset_killswitches_get():
+    stats.reset_kill_switches()
+    await send_telegram(
+        "🔓 *Kill switches manually reset*\n"
+        "All Night Bot is active again. Trade carefully."
+    )
+    return {"ok": True, "message": "Kill switches reset", "can_trade": True}
+
+
+@app.post("/reset_killswitches")
+async def reset_killswitches_post():
+    stats.reset_kill_switches()
+    await send_telegram(
+        "🔓 *Kill switches manually reset*\n"
+        "All Night Bot is active again. Trade carefully."
+    )
+    return {"ok": True, "message": "Kill switches reset", "can_trade": True}
+
+
 @app.post("/reset_kill_switches")
 async def reset_kill_switches():
     stats.reset_kill_switches()
     return {"ok": True, "kill_switches": stats.status()["kill_switches"]}
+
+
+@app.post("/trigger_reversal")
+async def trigger_reversal():
+    stats.trigger_reversal()
+    return {"ok": True, "reason": "Reversal kill switch triggered"}
 
 
 @app.post("/price-update")
