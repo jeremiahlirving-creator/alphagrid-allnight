@@ -576,9 +576,36 @@ async def price_update(request: Request):
         data = await request.json()
         symbol = data.get("symbol", "").upper()
         price = float(data.get("price", 0))
-        if symbol and price:
+        if symbol and price and symbol in prices:
             prices[symbol] = price
             logger.info(f"TradingView price: {symbol} = {price}")
+            # Process signal immediately on every price tick
+            sig = process_signal(symbol, price)
+            if sig:
+                signals.append(sig)
+                emoji = "🟢" if sig["direction"] == "LONG" else "🔴"
+                msg = (
+                    f"🌙 *ALL NIGHT BOT — {sig['session']}*\n"
+                    f"{emoji} *{sig['direction']}* {symbol} @ `{sig['sweep_level']}` sweep\n"
+                    f"━━━━━━━━━━━━━\n"
+                    f"🎯 Entry:  `{sig['entry']:,.2f}`\n"
+                    f"🛑 Stop:   `{sig['stop']:,.2f}`\n"
+                    f"✅ TP1:    `{sig['tp1']:,.2f}` (R:R {sig['rr1']}:1)\n"
+                    f"✅ TP2:    `{sig['tp2']:,.2f}`\n"
+                    f"🏃 Runner: `{sig['runner']:,.2f}`\n\n"
+                    f"💰 Risk: `${sig['risk']:.0f}` | {sig['contracts']} contracts\n"
+                    f"⏱ {sig['time']}"
+                )
+                kb = {"inline_keyboard": [[
+                    {"text": f"{'🟢 BUY' if sig['direction']=='LONG' else '🔴 SELL'} — EXECUTE",
+                     "url": f"https://alphagrid-allnight-production.up.railway.app/execute/{sig['id']}"},
+                    {"text": "⏭ Skip", "callback_data": f"skip_{sig['id']}"}
+                ]]}
+                asyncio.create_task(send_telegram(msg, kb))
+                await broadcast({
+                    "type": "signal", "signals": signals, "trades": trades,
+                    "stats": stats.status(),
+                })
         return {"ok": True}
     except Exception as e:
         logger.error(f"Price update error: {e}")
