@@ -1,13 +1,14 @@
-import asyncio, os, json, logging
+import asyncio, os, json, logging, uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, date, time, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import aiohttp
+
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
@@ -16,492 +17,460 @@ logger = logging.getLogger("allnight_bot")
 EST = ZoneInfo("America/New_York")
 
 # ── PROP FIRM CONFIG ──────────────────────────────────────────────────────────
-ACCOUNT_SIZE   = 50000
+ACCOUNT_SIZE   = 50_000
 MAX_RISK       = 500.0
-MAX_DRAWDOWN   = -1800
-PROFIT_TARGET  = 3000
-MAX_DAY_PROFIT = 1500
+MAX_DRAWDOWN   = -1_800
+PROFIT_TARGET  = 3_000
+MAX_DAY_PROFIT = 1_500
 
-# ── KILL SWITCH CONFIG ────────────────────────────────────────────────────────
-MODE               = os.getenv("MODE", "EVAL")          # EVAL or FUNDED
-DAILY_CAP_LIMIT    = float(os.getenv("DAILY_CAP_LIMIT", "2500"))   # max day profit before pause
-TRAILING_DD_LIMIT  = float(os.getenv("TRAILING_DD_LIMIT", "500"))  # max pullback from peak day pnl
-LOSS_STREAK_LIMIT  = int(os.getenv("LOSS_STREAK_LIMIT", "3"))      # consecutive losses before pause
+# ── AUTONOMOUS TRADE CONFIG ───────────────────────────────────────────────────
+# Two-leg split per trade signal:
+#   Leg 1 — 3 contracts, TP $200, SL $100  (base profit lock)
+#   Leg 2 — 2 contracts, TP $300, SL $100  (runner)
+LEG1_CONTRACTS = 3
+LEG1_TP        = 200.0
+LEG1_SL        = 100.0
 
-# Bot 2 instruments — MICRO contracts, 5 each
+LEG2_CONTRACTS = 2
+LEG2_TP        = 300.0
+LEG2_SL        = 100.0
+
+MAX_DAY_LOSS   = -300.0   # bot goes silent after -$300 on the day
+
+# Max theoretical win per signal: (3 * $200) + (2 * $300) = $1,200 (per-contract scaling via PMT dollar fields)
+# Max theoretical loss per signal: (3 * $100) + (2 * $100) = $500
+
+# ── WIN RATE ADAPTIVE FILTER ──────────────────────────────────────────────────
+WIN_RATE_THRESHOLD  = 0.60   # below 60% triggers tight mode
+WIN_RATE_MIN_TRADES = 10     # don't enforce until at least 10 trades
+
+# ── INSTRUMENTS — MICRO CONTRACTS ────────────────────────────────────────────
 INSTRUMENTS = {
-    "MES": {"pmt": "MES", "point_value": 5.0,  "stop_pts": 10, "contracts": 5, "name": "Micro E-mini S&P"},
-    "MNQ": {"pmt": "MNQ", "point_value": 2.0,  "stop_pts": 20, "contracts": 5, "name": "Micro E-mini Nasdaq"},
+    "MES": {"pmt": "MES", "point_value": 5.0,  "contracts": 5,
+            "sweep_buf_normal": 1.5, "sweep_buf_tight": 2.5,
+            "level_proximity_tight": 3.0,  "name": "Micro E-mini S&P"},
+    "MNQ": {"pmt": "MNQ", "point_value": 2.0,  "contracts": 5,
+            "sweep_buf_normal": 4.0, "sweep_buf_tight": 6.0,
+            "level_proximity_tight": 8.0,  "name": "Micro E-mini Nasdaq"},
 }
 
-# All three sessions
+# ── SESSION WINDOWS (EST) ─────────────────────────────────────────────────────
 SESSIONS = {
-    "asia":   {"name": "Asia",         "start": time(20, 0),  "end": time(23, 59), "emoji": "🟡"},
-    "london": {"name": "London",       "start": time(2, 0),   "end": time(5, 0),   "emoji": "🔵"},
-    "ny":     {"name": "NY Kill Zone", "start": time(8, 0),   "end": time(10, 30), "emoji": "🟢"},
+    "Asia":   (time(20, 0),  time(23, 59)),
+    "London": (time(2, 0),   time(5, 0)),
+    "NY_KZ":  (time(8, 0),   time(10, 30)),
 }
 
-PMT_URL     = os.getenv("PMT_WEBHOOK_URL", "https://api.pickmytrade.trade/v2/add-trade-data")
-PMT_TOKEN   = os.getenv("PMT_TOKEN", "")
-PMT_ACCOUNT = os.getenv("PMT_ACCOUNT_ID", "")
+# ── ENV ───────────────────────────────────────────────────────────────────────
+PMT_URL     = os.getenv("PMT_WEBHOOK_URL",  "https://api.pickmytrade.trade/v2/add-trade-data-latest?t=18504")
+PMT_TOKEN   = os.getenv("PMT_TOKEN",        "")
+PMT_ACCOUNT = os.getenv("PMT_ACCOUNT_ID",   "53430171")
 TG_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT     = os.getenv("TELEGRAM_CHAT_ID", "")
+TG_CHAT     = os.getenv("TELEGRAM_CHAT_ID",   "")
+TRADOVATE_ACCT = os.getenv("TRADOVATE_ACCOUNT_ID", "MFFUEVRPD505461063")
 
-prices     = {"MES": 0.0, "MNQ": 0.0}
-signals    = []
-trades     = []
-ws_clients = []
-last_signal = {"MES": 0, "MNQ": 0}
+# ── STATE ─────────────────────────────────────────────────────────────────────
+prices         = {"MES": 0.0, "MNQ": 0.0}
+signals        = []
+trades         = []
+ws_clients     = []
+last_signal    = {"MES": 0, "MNQ": 0}   # epoch timestamp
+
 session_levels = {
-    "MES": {"PDH": None, "PDL": None, "AsiaH": None, "AsiaL": None,
-            "LonH": None, "LonL": None, "PMH": None, "PML": None,
-            "NYOpenH": None, "NYOpenL": None},
-    "MNQ": {"PDH": None, "PDL": None, "AsiaH": None, "AsiaL": None,
-            "LonH": None, "LonL": None, "PMH": None, "PML": None,
-            "NYOpenH": None, "NYOpenL": None},
+    inst: {"PDH": None, "PDL": None, "AsiaH": None, "AsiaL": None,
+           "LonH": None, "LonL": None, "PMH": None, "PML": None,
+           "NYOpenH": None, "NYOpenL": None}
+    for inst in INSTRUMENTS
 }
 
 
+# ── PROP + WIN-RATE STATS ─────────────────────────────────────────────────────
 class PropStats:
     def __init__(self):
-        self.total_pnl      = 0.0
-        self.day_pnl        = 0.0
-        self.peak_day_pnl   = 0.0
-        self.day_date       = date.today()
-        self.trades         = 0
-        self.wins           = 0
-        self.losses         = 0
-        self.loss_streak    = 0
-        self.locked         = False
-        self.revenge_until  = None
-        # kill switch flags
-        self.ks_daily_cap   = False
-        self.ks_trailing_dd = False
-        self.ks_loss_streak = False
-        self.ks_reversal    = False
+        self.total_pnl  = 0.0
+        self.day_pnl    = 0.0
+        self.day_date   = date.today()
+        self.peak_pnl   = 0.0
+        self.wins       = 0
+        self.losses     = 0
+        self.tight_mode = False   # adaptive filter active
 
-    def new_day(self):
-        if date.today() != self.day_date:
-            self.day_pnl        = 0.0
-            self.peak_day_pnl   = 0.0
-            self.day_date       = date.today()
-            self.loss_streak    = 0
-            # reset intraday kill switches each new day
-            self.ks_daily_cap   = False
-            self.ks_trailing_dd = False
-            self.ks_loss_streak = False
-            self.ks_reversal    = False
+    def _check_day_reset(self):
+        today = date.today()
+        if self.day_date != today:
+            self.day_pnl  = 0.0
+            self.day_date = today
 
-    def record(self, pnl):
-        self.new_day()
+    @property
+    def total_trades(self):
+        return self.wins + self.losses
+
+    @property
+    def win_rate(self):
+        if self.total_trades == 0:
+            return 1.0
+        return self.wins / self.total_trades
+
+    def update_tight_mode(self):
+        if self.total_trades >= WIN_RATE_MIN_TRADES:
+            was_tight = self.tight_mode
+            self.tight_mode = self.win_rate < WIN_RATE_THRESHOLD
+            if self.tight_mode and not was_tight:
+                logger.warning(f"⚠️  Tight mode ON — win rate {self.win_rate:.1%} ({self.wins}W/{self.losses}L)")
+            elif not self.tight_mode and was_tight:
+                logger.info(f"✅  Tight mode OFF — win rate {self.win_rate:.1%} recovered")
+        else:
+            self.tight_mode = False
+
+    def record(self, pnl: float) -> bool:
+        """Record a closed trade. Returns True if account should lock."""
+        self._check_day_reset()
         self.total_pnl += pnl
         self.day_pnl   += pnl
-        self.trades    += 1
-
         if pnl > 0:
-            self.wins        += 1
-            self.loss_streak  = 0
+            self.wins += 1
         else:
-            self.losses      += 1
-            self.loss_streak += 1
-            self.revenge_until = datetime.utcnow() + timedelta(minutes=30)
+            self.losses += 1
+        self.update_tight_mode()
+        if self.total_pnl > self.peak_pnl:
+            self.peak_pnl = self.total_pnl
+        return self.total_pnl <= MAX_DRAWDOWN
 
-        # update peak day pnl
-        if self.day_pnl > self.peak_day_pnl:
-            self.peak_day_pnl = self.day_pnl
-
-        # evaluate kill switches
-        self._eval_kill_switches()
-
+    def can_trade(self) -> tuple[bool, str]:
+        """Returns (allowed, reason). Checks all kill conditions."""
+        self._check_day_reset()
         if self.total_pnl <= MAX_DRAWDOWN:
-            self.locked = True
-
-        return self.locked
-
-    def _eval_kill_switches(self):
-        # 1. Daily cap — prevent consistency rule breach
-        if self.day_pnl >= DAILY_CAP_LIMIT:
-            if not self.ks_daily_cap:
-                self.ks_daily_cap = True
-                asyncio.create_task(send_telegram(
-                    f"🛑 *KILL SWITCH — Daily Cap*\n"
-                    f"Day P&L `${self.day_pnl:.0f}` hit cap of `${DAILY_CAP_LIMIT:.0f}`\n"
-                    f"Bot paused for rest of day to protect consistency rule."
-                ))
-
-        # 2. Trailing drawdown from peak
-        drawdown_from_peak = self.peak_day_pnl - self.day_pnl
-        if self.peak_day_pnl > 0 and drawdown_from_peak >= TRAILING_DD_LIMIT:
-            if not self.ks_trailing_dd:
-                self.ks_trailing_dd = True
-                asyncio.create_task(send_telegram(
-                    f"🛑 *KILL SWITCH — Trailing Drawdown*\n"
-                    f"Pulled back `${drawdown_from_peak:.0f}` from peak of `${self.peak_day_pnl:.0f}`\n"
-                    f"Bot paused to protect gains."
-                ))
-
-        # 3. Loss streak
-        if self.loss_streak >= LOSS_STREAK_LIMIT:
-            if not self.ks_loss_streak:
-                self.ks_loss_streak = True
-                asyncio.create_task(send_telegram(
-                    f"🛑 *KILL SWITCH — Loss Streak*\n"
-                    f"`{self.loss_streak}` consecutive losses\n"
-                    f"Bot paused — market conditions unfavorable."
-                ))
-
-    def trigger_reversal(self):
-        """Manually trigger reversal kill switch (e.g. from dashboard)."""
-        if not self.ks_reversal:
-            self.ks_reversal = True
-            asyncio.create_task(send_telegram(
-                "🛑 *KILL SWITCH — Reversal Detected*\n"
-                "Manual reversal trigger fired.\n"
-                "Bot paused."
-            ))
-
-    def reset_kill_switches(self):
-        self.ks_daily_cap   = False
-        self.ks_trailing_dd = False
-        self.ks_loss_streak = False
-        self.ks_reversal    = False
-
-    def any_kill_switch(self):
-        return self.ks_daily_cap or self.ks_trailing_dd or self.ks_loss_streak or self.ks_reversal
-
-    def can_trade(self):
-        self.new_day()
-        if self.locked:                      return False, "Max drawdown hit"
-        if self.total_pnl >= PROFIT_TARGET:  return False, "Profit target reached"
-        if self.day_pnl   >= MAX_DAY_PROFIT: return False, "Daily consistency limit"
-        if self.revenge_until and datetime.utcnow() < self.revenge_until:
-            return False, "Revenge trade cooldown"
-        if self.ks_daily_cap:   return False, "Kill switch: daily cap"
-        if self.ks_trailing_dd: return False, "Kill switch: trailing drawdown"
-        if self.ks_loss_streak: return False, "Kill switch: loss streak"
-        if self.ks_reversal:    return False, "Kill switch: reversal"
-        return True, "OK"
+            return False, f"Account drawdown limit hit (${self.total_pnl:.0f})"
+        if self.day_pnl >= MAX_DAY_PROFIT:
+            return False, f"Daily profit cap hit (${self.day_pnl:.0f})"
+        if self.day_pnl <= MAX_DAY_LOSS:
+            return False, f"Daily loss limit hit (${self.day_pnl:.0f})"
+        return True, "ok"
 
     def status(self):
-        ok, reason = self.can_trade()
-        mins_left = 0
-        if self.revenge_until and datetime.utcnow() < self.revenge_until:
-            mins_left = int((self.revenge_until - datetime.utcnow()).total_seconds() / 60)
-        drawdown_from_peak = round(self.peak_day_pnl - self.day_pnl, 2)
         return {
-            "total_pnl":         round(self.total_pnl, 2),
-            "day_pnl":           round(self.day_pnl, 2),
-            "peak_day_pnl":      round(self.peak_day_pnl, 2),
-            "drawdown_from_peak": drawdown_from_peak,
-            "loss_streak":       self.loss_streak,
-            "trades":            self.trades,
-            "wins":              self.wins,
-            "losses":            self.losses,
-            "win_rate":          round(self.wins / self.trades * 100, 1) if self.trades else 0,
-            "locked":            self.locked,
-            "can_trade":         ok,
-            "reason":            reason,
-            "revenge_mins":      mins_left,
-            "to_target":         round(PROFIT_TARGET - self.total_pnl, 2),
-            "drawdown_used":     round(abs(min(0, self.total_pnl)) / abs(MAX_DRAWDOWN) * 100, 1),
-            "kill_switches": {
-                "daily_cap":   self.ks_daily_cap,
-                "trailing_dd": self.ks_trailing_dd,
-                "loss_streak": self.ks_loss_streak,
-                "reversal":    self.ks_reversal,
-            },
-            "mode":              MODE,
-            "daily_cap_limit":   int(DAILY_CAP_LIMIT),
-            "trailing_dd_limit": int(TRAILING_DD_LIMIT),
+            "total_pnl":    round(self.total_pnl, 2),
+            "day_pnl":      round(self.day_pnl, 2),
+            "peak_pnl":     round(self.peak_pnl, 2),
+            "wins":         self.wins,
+            "losses":       self.losses,
+            "win_rate":     round(self.win_rate * 100, 1),
+            "total_trades": self.total_trades,
+            "tight_mode":   self.tight_mode,
+            "day_loss_remaining": round(MAX_DAY_LOSS - self.day_pnl, 2),
+            "day_profit_remaining": round(MAX_DAY_PROFIT - self.day_pnl, 2),
         }
 
 
 stats = PropStats()
 
 
-def get_active_session():
-    now = datetime.now(EST)
-    t   = now.time()
-    for key, sess in SESSIONS.items():
-        start, end = sess["start"], sess["end"]
-        if start <= end:
-            if start <= t <= end: return key, sess
-        else:
-            if t >= start or t <= end: return key, sess
-    return None, None
-
-
-def in_any_session():
-    key, _ = get_active_session()
-    return key is not None
-
-
-def get_phase():
-    key, sess = get_active_session()
-    if key: return f"{sess['name']} Session"
-    now = datetime.now(EST)
-    t   = now.time()
-    if time(5, 0) <= t < time(8, 0): return "NY Pre-Market"
-    return "Between Sessions"
-
-
-def check_sweep(price, inst):
-    lvls = session_levels[inst]
-    buf  = 1.5 if inst == "MES" else 4.0
-    for name, val in lvls.items():
-        if val is None: continue
-        if price > val + buf: return name, val, "SHORT"
-        if price < val - buf: return name, val, "LONG"
+# ── HELPERS ───────────────────────────────────────────────────────────────────
+def get_session(now_est: datetime) -> Optional[str]:
+    t = now_est.time()
+    for name, (start, end) in SESSIONS.items():
+        if start <= t <= end:
+            return name
     return None
 
 
-def process_signal(inst, price):
-    if not in_any_session(): return None
-    ok, _ = stats.can_trade()
-    if not ok: return None
-    if datetime.utcnow().timestamp() - last_signal[inst] < 600: return None
-    lvls = session_levels[inst]
-    if sum(1 for v in lvls.values() if v is not None) < 4: return None
-    sweep = check_sweep(price, inst)
-    if not sweep: return None
-    sweep_name, sweep_val, direction = sweep
-    cfg       = INSTRUMENTS[inst]
-    stop_pts  = cfg["stop_pts"]
-    pv        = cfg["point_value"]
-    contracts = cfg["contracts"]
-    if direction == "LONG":
-        stop   = round(price - stop_pts, 2)
-        tp1    = round(price + stop_pts * 2.5, 2)
-        tp2    = lvls.get("PDH") or round(price + stop_pts * 4, 2)
-        runner = round(price + stop_pts * 6, 2)
-    else:
-        stop   = round(price + stop_pts, 2)
-        tp1    = round(price - stop_pts * 2.5, 2)
-        tp2    = lvls.get("PDL") or round(price - stop_pts * 4, 2)
-        runner = round(price - stop_pts * 6, 2)
-    risk = abs(price - stop) * pv * contracts
-    if risk > MAX_RISK: return None
-    last_signal[inst] = datetime.utcnow().timestamp()
-    reward = round(abs(tp1 - price) * pv * contracts, 2)
-    sess_key, sess = get_active_session()
-    return {
-        "id":          f"{inst}_{int(datetime.utcnow().timestamp())}",
-        "inst":        inst,
-        "direction":   direction,
-        "sweep_level": sweep_name,
-        "entry":       round(price, 2),
-        "stop":        stop,
-        "tp1":         tp1,
-        "tp2":         round(tp2 if isinstance(tp2, float) else float(tp2), 2),
-        "runner":      runner,
-        "risk":        round(risk, 2),
-        "reward_tp1":  reward,
-        "rr1":         round(abs(tp1 - price) / abs(price - stop), 1) if abs(price - stop) > 0 else 0,
-        "dollar_sl":   round(risk, 2),
-        "dollar_tp":   reward,
-        "session":     f"{sess['name']} {sess['emoji']}" if sess else "Active",
-        "contracts":   contracts,
-        "time":        datetime.now(EST).strftime("%H:%M:%S EST"),
-        "confidence":  78,
-    }
+def get_nearest_level(inst: str, price: float) -> Optional[float]:
+    """Return nearest session level to current price, or None."""
+    lvls = [v for v in session_levels[inst].values() if v is not None]
+    if not lvls:
+        return None
+    return min(lvls, key=lambda x: abs(x - price))
 
 
-async def send_telegram(msg, keyboard=None):
-    if not TG_TOKEN or not TG_CHAT: return
+def level_proximity_ok(inst: str, price: float) -> bool:
+    """In tight mode: price must be within level_proximity_tight of a key level."""
+    if not stats.tight_mode:
+        return True
+    nearest = get_nearest_level(inst, price)
+    if nearest is None:
+        return False
+    cfg = INSTRUMENTS[inst]
+    return abs(price - nearest) <= cfg["level_proximity_tight"]
+
+
+async def broadcast(msg: dict):
+    dead = []
+    for ws in ws_clients:
+        try:
+            await ws.send_text(json.dumps(msg))
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        try:
+            ws_clients.remove(ws)
+        except ValueError:
+            pass
+
+
+async def send_telegram(text: str, parse_mode="Markdown"):
+    if not TG_TOKEN or not TG_CHAT:
+        return
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    payload = {"chat_id": TG_CHAT, "text": msg, "parse_mode": "Markdown"}
-    if keyboard: payload["reply_markup"] = keyboard
     try:
-        async with aiohttp.ClientSession() as s:
-            await s.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=5))
+        async with aiohttp.ClientSession() as session:
+            await session.post(url, json={
+                "chat_id": TG_CHAT, "text": text, "parse_mode": parse_mode
+            }, timeout=aiohttp.ClientTimeout(total=5))
     except Exception as e:
         logger.warning(f"Telegram error: {e}")
 
-async def fire_webhook(sig):
+
+# ── PMT WEBHOOK ───────────────────────────────────────────────────────────────
+async def _send_pmt(inst: str, direction: str, qty: int,
+                    dollar_tp: float, dollar_sl: float,
+                    strategy_suffix: str) -> tuple[bool, str]:
+    """Fire a single PMT webhook for one leg."""
+    cfg = INSTRUMENTS[inst]
     payload = {
-        "symbol":                sig["inst"],
-        "strategy_name":         "All night",
-        "date":                  datetime.utcnow().isoformat(),
-        "data":                  "buy" if sig["direction"] == "LONG" else "sell",
-        "quantity":              sig["contracts"],
-        "risk_percentage":       0,
-        "price":                 sig["entry"],
-        "tp": 0, "percentage_tp": 0, "dollar_tp": sig["dollar_tp"],
-        "sl": 0, "dollar_sl": sig["dollar_sl"], "percentage_sl": 0,
-        "trail": 0, "trail_stop": 0, "trail_trigger": 0, "trail_freq": 0,
-        "update_tp": False, "update_sl": False,
-        "breakeven": 0, "breakeven_offset": 0,
         "token":                 PMT_TOKEN,
-        "pyramid":               True,
-        "same_direction_ignore": False,
-        "reverse_order_close":   False,
-        "multiple_accounts": [
-            {
-                "token":               PMT_TOKEN,
-                "account_id":          "MFFUEVRPD505461065",
-                "risk_percentage":     0,
-                "quantity_multiplier": 1,
-            }
-        ],
+        "strategy_name":         f"AlphaGrid_{inst}_{strategy_suffix}",
+        "ticker":                cfg["pmt"],
+        "action":                direction.lower(),
+        "quantity_multiplier":   1,
+        "breakeven_offset":      0,
+        "same_direction_ignore": False,   # both legs must open independently
+        "dollar_tp":             dollar_tp,
+        "dollar_sl":             dollar_sl,
+        "multiple_accounts": [{
+            "account_id":     TRADOVATE_ACCT,
+            "pmt_account_id": PMT_ACCOUNT,
+            "quantity":       qty,
+        }]
     }
     headers = {
         "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
-        "Origin": "https://www.pickmytrade.trade",
-        "Referer": "https://www.pickmytrade.trade/",
+        "User-Agent":   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Origin":       "https://www.pickmytrade.trade",
+        "Referer":      "https://www.pickmytrade.trade/",
     }
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.post(PMT_URL, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            async with s.post(PMT_URL, json=payload, headers=headers,
+                              timeout=aiohttp.ClientTimeout(total=10)) as r:
                 body = await r.text()
-                logger.info(f"PMT response: {r.status} {body}")
-                return r.status == 200, body
+                ok   = r.status == 200 and "success" in body.lower()
+                return ok, body
     except Exception as e:
-        logger.error(f"fire_webhook error: {e}")
         return False, str(e)
 
-async def broadcast(data):
-    dead = []
-    for ws in ws_clients:
-        try: await ws.send_text(json.dumps(data))
-        except: dead.append(ws)
-    for ws in dead:
-        try: ws_clients.remove(ws)
-        except: pass
 
-
-async def price_loop():
-    logger.info("All Night Bot started — watching MES + MNQ (5 contracts each)")
-    while True:
-        try:
-            for inst, cfg in INSTRUMENTS.items():
-                try:
-                    price = prices.get(inst)
-                    if price:
-                        prices[inst] = price
-                        logger.info(f"{inst}: {price}")
-                        sig = process_signal(inst, price)
-                        if sig:
-                            signals.append(sig)
-                            emoji = "🟢" if sig["direction"] == "LONG" else "🔴"
-                            msg = (
-                                f"🌙 *ALL NIGHT BOT — {sig['session']}*\n"
-                                f"{emoji} *{sig['direction']}* {inst} @ `{sig['sweep_level']}` sweep\n"
-                                f"━━━━━━━━━━━━━\n"
-                                f"🎯 Entry:  `{sig['entry']:,.2f}`\n"
-                                f"🛑 Stop:   `{sig['stop']:,.2f}`\n"
-                                f"✅ TP1:    `{sig['tp1']:,.2f}` (R:R {sig['rr1']}:1)\n"
-                                f"✅ TP2:    `{sig['tp2']:,.2f}`\n"
-                                f"🏃 Runner: `{sig['runner']:,.2f}`\n\n"
-                                f"💰 Risk: `${sig['risk']:.0f}` | {sig['contracts']} contracts\n"
-                                f"⏱ {sig['time']}"
-                            )
-                            kb = {"inline_keyboard": [[
-                                {"text": f"{'🟢 BUY' if sig['direction']=='LONG' else '🔴 SELL'} — EXECUTE",
-                                 "url": f"https://alphagrid-allnight-production.up.railway.app/execute/{sig['id']}"},
-                                {"text": "⏭ Skip", "callback_data": f"skip_{sig['id']}"}
-                            ]]}
-                            asyncio.create_task(send_telegram(msg, kb))
-                        await broadcast({
-                            "type": "price", "inst": inst, "price": price,
-                            "signals": signals, "trades": trades,
-                            "stats": stats.status(),
-                            "phase": get_phase(), "session": get_active_session()[0],
-                        })
-                except Exception as e:
-                    logger.error(f"Error processing {inst}: {e}")
-        except Exception as e:
-            logger.error(f"Price loop error: {e}")
-        await asyncio.sleep(3)
-
-
-@asynccontextmanager
-async def lifespan(app):
-    logger.info("All Night Bot starting (MES + MNQ, 5 contracts)...")
-    task = asyncio.create_task(price_loop())
-    await send_telegram(
-        "🌙 *All Night Bot online*\n"
-        "Watching *MES + MNQ* — 5 contracts each\n"
-        "🟡 Asia · 🔵 London · 🟢 NY Kill Zone\n"
-        "Prop firm rules active · Kill switches armed · $50K account"
+async def fire_trade_legs(sig: dict) -> tuple[bool, bool, str, str]:
+    """
+    Fire both legs simultaneously.
+    Returns (leg1_ok, leg2_ok, leg1_body, leg2_body).
+    """
+    inst      = sig["inst"]
+    direction = sig["direction"]
+    leg1, leg2 = await asyncio.gather(
+        _send_pmt(inst, direction, LEG1_CONTRACTS, LEG1_TP, LEG1_SL, "L1"),
+        _send_pmt(inst, direction, LEG2_CONTRACTS, LEG2_TP, LEG2_SL, "L2"),
     )
+    return leg1[0], leg2[0], leg1[1], leg2[1]
+
+
+# ── SIGNAL ENGINE ─────────────────────────────────────────────────────────────
+async def check_signals(inst: str, price: float, now: datetime):
+    session = get_session(now)
+    if not session:
+        return
+
+    cfg      = INSTRUMENTS[inst]
+    levels   = session_levels[inst]
+    cooldown = 1200 if stats.tight_mode else 600   # 20min tight / 10min normal
+    buf      = cfg["sweep_buf_tight"] if stats.tight_mode else cfg["sweep_buf_normal"]
+
+    # Cooldown gate
+    if (now.timestamp() - last_signal[inst]) < cooldown:
+        return
+
+    # Proximity gate (tight mode only)
+    if not level_proximity_ok(inst, price):
+        return
+
+    direction = None
+    swept_level = None
+
+    # ── Bullish sweep: price dips below a LOW level then recovers
+    low_levels = {k: v for k, v in levels.items()
+                  if v is not None and k in ("AsiaL", "LonL", "PDL", "PML", "NYOpenL")}
+    for k, lvl in low_levels.items():
+        if price < lvl - buf:          # swept below
+            direction   = "BUY"
+            swept_level = (k, lvl)
+            break
+
+    # ── Bearish sweep: price spikes above a HIGH level then rejects
+    if not direction:
+        high_levels = {k: v for k, v in levels.items()
+                       if v is not None and k in ("AsiaH", "LonH", "PDH", "PMH", "NYOpenH")}
+        for k, lvl in high_levels.items():
+            if price > lvl + buf:
+                direction   = "SELL"
+                swept_level = (k, lvl)
+                break
+
+    if not direction or not swept_level:
+        return
+
+    # Build signal
+    stop_pts = 10 if inst == "MES" else 20
+    tp_pts   = stop_pts * (DOLLAR_TP / DOLLAR_SL)   # maintain R-multiple geometrically
+    if direction == "BUY":
+        stop = price - stop_pts
+        tp1  = price + tp_pts
+    else:
+        stop = price + stop_pts
+        tp1  = price - tp_pts
+
+    sig = {
+        "id":          str(uuid.uuid4())[:8],
+        "inst":        inst,
+        "direction":   direction,
+        "entry":       price,
+        "stop":        stop,
+        "tp1":         tp1,
+        "leg1_tp":     LEG1_TP,
+        "leg1_sl":     LEG1_SL,
+        "leg1_qty":    LEG1_CONTRACTS,
+        "leg2_tp":     LEG2_TP,
+        "leg2_sl":     LEG2_SL,
+        "leg2_qty":    LEG2_CONTRACTS,
+        "contracts":   LEG1_CONTRACTS + LEG2_CONTRACTS,
+        "session":     session,
+        "swept":       swept_level[0],
+        "tight_mode":  stats.tight_mode,
+        "ts":          now.strftime("%H:%M:%S"),
+    }
+
+    last_signal[inst] = now.timestamp()
+
+    # ── AUTO-EXECUTE ──────────────────────────────────────────────────────────
+    allowed, reason = stats.can_trade()
+    if not allowed:
+        logger.info(f"🚫 Signal blocked [{inst}]: {reason}")
+        await send_telegram(
+            f"🚫 *Signal blocked* — {inst} {direction}\n"
+            f"Reason: {reason}"
+        )
+        return
+
+    logger.info(
+        f"🚀 Auto-executing {inst} {direction} @ {price:.2f} | "
+        f"L1: {LEG1_CONTRACTS}ct TP${LEG1_TP}/SL${LEG1_SL}  "
+        f"L2: {LEG2_CONTRACTS}ct TP${LEG2_TP}/SL${LEG2_SL} | "
+        f"Tight={stats.tight_mode}"
+    )
+    l1_ok, l2_ok, l1_body, l2_body = await fire_trade_legs(sig)
+
+    if l1_ok or l2_ok:
+        trades.insert(0, {**sig, "status": "EXECUTED",
+                           "l1_ok": l1_ok, "l2_ok": l2_ok,
+                           "executed_at": now.strftime("%H:%M:%S")})
+        await broadcast({"type": "executed", "sig": sig, "stats": stats.status()})
+        mode_tag = "🔒 TIGHT" if stats.tight_mode else "✅ NORMAL"
+        wr_str   = f"{stats.win_rate:.0%} ({stats.wins}W/{stats.losses}L)" if stats.total_trades else "—"
+        l1_tag   = "✅" if l1_ok else "❌"
+        l2_tag   = "✅" if l2_ok else "❌"
+        await send_telegram(
+            f"🤖 *Auto-Trade Fired* [{mode_tag}]\n"
+            f"`{inst}` {direction} @ `{price:,.2f}`\n"
+            f"{l1_tag} Leg 1: `{LEG1_CONTRACTS}ct` TP `+${LEG1_TP:.0f}` SL `-${LEG1_SL:.0f}`\n"
+            f"{l2_tag} Leg 2: `{LEG2_CONTRACTS}ct` TP `+${LEG2_TP:.0f}` SL `-${LEG2_SL:.0f}` (runner)\n"
+            f"Session: {session} | Swept: {swept_level[0]}\n"
+            f"Win Rate: {wr_str} | Day P&L: `${stats.day_pnl:+.0f}`"
+        )
+        if not l1_ok:
+            logger.error(f"Leg 1 failed [{inst}]: {l1_body}")
+        if not l2_ok:
+            logger.error(f"Leg 2 failed [{inst}]: {l2_body}")
+    else:
+        logger.error(f"Both legs failed [{inst}]: L1={l1_body} L2={l2_body}")
+        await send_telegram(
+            f"⚠️ *Both legs failed* — {inst} {direction}\n"
+            f"L1: `{l1_body[:100]}`\nL2: `{l2_body[:100]}`"
+        )
+
+
+# ── LIFESPAN ──────────────────────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("AlphaGrid All Night Bot starting — autonomous mode 🤖")
+    logger.info(f"L1: {LEG1_CONTRACTS}ct TP${LEG1_TP}/SL${LEG1_SL} | L2: {LEG2_CONTRACTS}ct TP${LEG2_TP}/SL${LEG2_SL} | DayLoss cap=${MAX_DAY_LOSS}")
     yield
-    task.cancel()
-    await send_telegram("🔴 *All Night Bot offline*")
+    logger.info("Bot shutting down")
 
 
 app = FastAPI(lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                   allow_methods=["*"], allow_headers=["*"])
 
 
+# ── ENDPOINTS ─────────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    sess_key, sess = get_active_session()
-    return {"status": "ok", "phase": get_phase(), "session": sess_key,
-            "instruments": "MES + MNQ", "contracts": 5, **stats.status()}
+    s = stats.status()
+    allowed, reason = stats.can_trade()
+    return {
+        "status":     "ok",
+        "trading":    allowed,
+        "reason":     reason,
+        "tight_mode": stats.tight_mode,
+        **s,
+        "prices":     prices,
+    }
 
 
-@app.get("/state")
-async def get_state():
-    sess_key, _ = get_active_session()
-    return {"prices": prices, "signals": signals, "trades": trades,
-            "session_levels": session_levels,
-            "phase": get_phase(), "session": sess_key, **stats.status()}
+@app.post("/price-update")
+async def price_update(req: Request):
+    body = await req.json()
+    inst  = body.get("ticker", "").upper().replace("1!", "").replace("!", "")
+    price = float(body.get("price", 0))
+
+    if inst not in INSTRUMENTS or price <= 0:
+        return {"ok": False, "reason": "unknown instrument"}
+
+    prices[inst] = price
+    now = datetime.now(EST)
+    await check_signals(inst, price, now)
+    await broadcast({"type": "price", "inst": inst, "price": price,
+                     "tight_mode": stats.tight_mode, "stats": stats.status()})
+    return {"ok": True, "inst": inst, "price": price}
 
 
-class LevelsPayload(BaseModel):
-    instrument: str
-    PDH: Optional[float] = None
-    PDL: Optional[float] = None
-    AsiaH: Optional[float] = None
-    AsiaL: Optional[float] = None
-    LonH: Optional[float] = None
-    LonL: Optional[float] = None
-    PMH: Optional[float] = None
-    PML: Optional[float] = None
+class LevelPayload(BaseModel):
+    inst:    str
+    PDH:     Optional[float] = None
+    PDL:     Optional[float] = None
+    AsiaH:   Optional[float] = None
+    AsiaL:   Optional[float] = None
+    LonH:    Optional[float] = None
+    LonL:    Optional[float] = None
+    PMH:     Optional[float] = None
+    PML:     Optional[float] = None
     NYOpenH: Optional[float] = None
     NYOpenL: Optional[float] = None
 
 
 @app.post("/levels")
-async def set_levels(p: LevelsPayload):
-    inst = p.instrument
-    for k in ["PDH","PDL","AsiaH","AsiaL","LonH","LonL","PMH","PML","NYOpenH","NYOpenL"]:
+async def set_levels(p: LevelPayload):
+    inst = p.inst.upper()
+    if inst not in session_levels:
+        return {"ok": False, "reason": "unknown instrument"}
+    for k in session_levels[inst]:
         v = getattr(p, k, None)
         if v is not None:
             session_levels[inst][k] = v
+    logger.info(f"Levels updated [{inst}]: {session_levels[inst]}")
     await broadcast({"type": "levels", "inst": inst, "levels": session_levels[inst]})
-    return {"ok": True}
-
-
-@app.get("/execute/{sig_id}")
-async def execute_get(sig_id: str):
-    ok, reason = stats.can_trade()
-    if not ok:
-        return {"success": False, "reason": reason}
-    sig = next((s for s in signals if s["id"] == sig_id), None)
-    if not sig:
-        return {"success": False, "reason": "Signal not found or expired"}
-    success, body = await fire_webhook(sig)
-    if success:
-        signals[:] = [s for s in signals if s["id"] != sig_id]
-        trades.insert(0, {**sig, "status": "EXECUTED", "executed_at": datetime.now(EST).strftime("%H:%M:%S")})
-        await broadcast({"type": "trade_executed", "trades": trades, "signals": signals, "stats": stats.status()})
-        await send_telegram(f"✅ *Order fired* — {sig['inst']} {sig['direction']} @ `{sig['entry']:,.2f}`")
-        return {"success": True, "message": "Order executed successfully"}
-    else:
-        return {"success": False, "reason": "Webhook failed"}
-
-
-@app.post("/dismiss/{sig_id}")
-async def dismiss(sig_id: str):
-    signals[:] = [s for s in signals if s["id"] != sig_id]
-    await broadcast({"type": "dismissed", "sig_id": sig_id})
-    return {"ok": True}
+    return {"ok": True, "levels": session_levels[inst]}
 
 
 class ResultPayload(BaseModel):
-    sig_id: str
     pnl: float
     won: bool
 
@@ -512,113 +481,68 @@ async def record_result(p: ResultPayload):
     s = stats.status()
     await broadcast({"type": "result", "pnl": p.pnl, "stats": s})
     if locked:
-        await send_telegram(f"⛔ *ACCOUNT LOCKED*\nDrawdown: `${abs(stats.total_pnl):.0f}`")
+        await send_telegram(
+            f"⛔ *ACCOUNT LOCKED*\n"
+            f"Total drawdown: `${stats.total_pnl:.0f}`\nBot paused until manual reset."
+        )
+    elif stats.tight_mode:
+        await send_telegram(
+            f"⚠️ *Tight Mode Active*\n"
+            f"Win rate: `{stats.win_rate:.0%}` ({stats.wins}W/{stats.losses}L)\n"
+            f"Entry filters tightened until win rate recovers above 60%."
+        )
     return s
 
 
 @app.post("/reset_day")
 async def reset_day():
-    stats.day_pnl       = 0.0
-    stats.peak_day_pnl  = 0.0
-    stats.day_date      = date.today()
-    stats.loss_streak   = 0
-    stats.reset_kill_switches()
+    stats.day_pnl  = 0.0
+    stats.day_date = date.today()
     signals.clear()
+    logger.info("Day stats reset")
     return {"ok": True}
 
 
-@app.get("/reset_day")
-async def reset_day_get():
-    stats.day_pnl       = 0.0
-    stats.peak_day_pnl  = 0.0
-    stats.day_date      = date.today()
-    stats.loss_streak   = 0
-    stats.reset_kill_switches()
-    signals.clear()
-    return {"ok": True, "message": "Day reset — kill switches cleared"}
+@app.post("/reset_stats")
+async def reset_stats():
+    """Full reset — wins, losses, win rate, P&L."""
+    stats.__init__()
+    logger.info("Full stats reset")
+    return {"ok": True}
 
 
-@app.get("/reset_killswitches")
-async def reset_killswitches_get():
-    stats.reset_kill_switches()
-    await send_telegram(
-        "🔓 *Kill switches manually reset*\n"
-        "All Night Bot is active again. Trade carefully."
-    )
-    return {"ok": True, "message": "Kill switches reset", "can_trade": True}
-
-
-@app.post("/reset_killswitches")
-async def reset_killswitches_post():
-    stats.reset_kill_switches()
-    await send_telegram(
-        "🔓 *Kill switches manually reset*\n"
-        "All Night Bot is active again. Trade carefully."
-    )
-    return {"ok": True, "message": "Kill switches reset", "can_trade": True}
-
-
-@app.post("/reset_kill_switches")
-async def reset_kill_switches():
-    stats.reset_kill_switches()
-    return {"ok": True, "kill_switches": stats.status()["kill_switches"]}
-
-
-@app.post("/trigger_reversal")
-async def trigger_reversal():
-    stats.trigger_reversal()
-    return {"ok": True, "reason": "Reversal kill switch triggered"}
-
-
-@app.post("/price-update")
-async def price_update(request: Request):
-    try:
-        data = await request.json()
-        symbol = data.get("symbol", "").upper()
-        price = float(data.get("price", 0))
-        if symbol and price and symbol in prices:
-            prices[symbol] = price
-            logger.info(f"TradingView price: {symbol} = {price}")
-            # Process signal immediately on every price tick
-            sig = process_signal(symbol, price)
-            if sig:
-                signals.append(sig)
-                emoji = "🟢" if sig["direction"] == "LONG" else "🔴"
-                msg = (
-                    f"🌙 *ALL NIGHT BOT — {sig['session']}*\n"
-                    f"{emoji} *{sig['direction']}* {symbol} @ `{sig['sweep_level']}` sweep\n"
-                    f"━━━━━━━━━━━━━\n"
-                    f"🎯 Entry:  `{sig['entry']:,.2f}`\n"
-                    f"🛑 Stop:   `{sig['stop']:,.2f}`\n"
-                    f"✅ TP1:    `{sig['tp1']:,.2f}` (R:R {sig['rr1']}:1)\n"
-                    f"✅ TP2:    `{sig['tp2']:,.2f}`\n"
-                    f"🏃 Runner: `{sig['runner']:,.2f}`\n\n"
-                    f"💰 Risk: `${sig['risk']:.0f}` | {sig['contracts']} contracts\n"
-                    f"⏱ {sig['time']}"
-                )
-                kb = {"inline_keyboard": [[
-                    {"text": f"{'🟢 BUY' if sig['direction']=='LONG' else '🔴 SELL'} — EXECUTE",
-                     "url": f"https://alphagrid-allnight-production.up.railway.app/execute/{sig['id']}"},
-                    {"text": "⏭ Skip", "callback_data": f"skip_{sig['id']}"}
-                ]]}
-                asyncio.create_task(send_telegram(msg, kb))
-                await broadcast({
-                    "type": "signal", "signals": signals, "trades": trades,
-                    "stats": stats.status(),
-                })
-        return {"ok": True}
-    except Exception as e:
-        logger.error(f"Price update error: {e}")
-        return {"ok": False}
+@app.get("/stats")
+async def get_stats():
+    allowed, reason = stats.can_trade()
+    return {**stats.status(), "trading_allowed": allowed, "reason": reason}
 
 
 @app.websocket("/ws")
 async def ws_ep(ws: WebSocket):
     await ws.accept()
     ws_clients.append(ws)
-    await ws.send_text(json.dumps({"type": "init", **await get_state()}))
+    await ws.send_text(json.dumps({
+        "type":        "init",
+        "prices":      prices,
+        "trades":      trades[:20],
+        "stats":       stats.status(),
+        "levels":      session_levels,
+        "config": {
+            "leg1_contracts": LEG1_CONTRACTS,
+            "leg1_tp":        LEG1_TP,
+            "leg1_sl":        LEG1_SL,
+            "leg2_contracts": LEG2_CONTRACTS,
+            "leg2_tp":        LEG2_TP,
+            "leg2_sl":        LEG2_SL,
+            "max_day_loss":   MAX_DAY_LOSS,
+            "win_rate_threshold": WIN_RATE_THRESHOLD,
+        }
+    }))
     try:
-        while True: await ws.receive_text()
+        while True:
+            await ws.receive_text()
     except WebSocketDisconnect:
-        try: ws_clients.remove(ws)
-        except: pass
+        try:
+            ws_clients.remove(ws)
+        except ValueError:
+            pass
