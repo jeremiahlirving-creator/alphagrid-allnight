@@ -462,11 +462,24 @@ async def check_signals(inst: str, price: float, now: datetime):
         await broadcast({"type": "executed", "sig": sig, "stats": stats.status()})
         mode_tag = "🔒 TIGHT" if stats.tight_mode else "✅ NORMAL"
         wr_str   = f"{stats.win_rate:.0%} ({stats.wins}W/{stats.losses}L)" if stats.total_trades else "—"
+        pv       = INSTRUMENTS[inst]["point_value"]
+        l1_tp_pts = LEG1_TP / LEG1_CONTRACTS / pv
+        l2_tp_pts = LEG2_TP / LEG2_CONTRACTS / pv
+        sl_pts    = LEG1_SL / LEG1_CONTRACTS / pv
+        if direction == "BUY":
+            l1_target = price + l1_tp_pts
+            l2_target = price + l2_tp_pts
+            sl_price  = price - sl_pts
+        else:
+            l1_target = price - l1_tp_pts
+            l2_target = price - l2_tp_pts
+            sl_price  = price + sl_pts
         await send_telegram(
             f"🤖 *Auto-Trade Fired* [{mode_tag}]\n"
-            f"`{inst}` {direction} @ `{price:,.2f}`\n"
-            f"{'✅' if l1_ok else '❌'} L1: `{LEG1_CONTRACTS}ct` TP `+${LEG1_TP:.0f}` SL `-${LEG1_SL:.0f}`\n"
-            f"{'✅' if l2_ok else '❌'} L2: `{LEG2_CONTRACTS}ct` TP `+${LEG2_TP:.0f}` SL `-${LEG2_SL:.0f}` (runner)\n"
+            f"`{inst}` {direction} @ `{price:,.2f}`\n\n"
+            f"{'✅' if l1_ok else '❌'} *L1* `{LEG1_CONTRACTS}ct` needs `{l1_tp_pts:.1f}pts` → `{l1_target:,.2f}` TP `+${LEG1_TP:.0f}`\n"
+            f"{'✅' if l2_ok else '❌'} *L2* `{LEG2_CONTRACTS}ct` needs `{l2_tp_pts:.1f}pts` → `{l2_target:,.2f}` TP `+${LEG2_TP:.0f}` 🏃\n"
+            f"🛑 SL `{sl_pts:.1f}pts` → `{sl_price:,.2f}` `-${LEG1_SL:.0f}`\n\n"
             f"Session: {session} | Swept: {swept_level[0]}\n"
             f"Win Rate: {wr_str} | Day P&L: `${stats.day_pnl:+.0f}`"
         )
