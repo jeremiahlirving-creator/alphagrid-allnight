@@ -16,11 +16,20 @@ logger = logging.getLogger("allnight_bot")
 
 EST = ZoneInfo("America/New_York")
 
-# ── PROP FIRM CONFIG ──────────────────────────────────────────────────────────
-MAX_DRAWDOWN   = -1_800
-PROFIT_TARGET  =  3_000
-MAX_DAY_PROFIT =  1_500
-MAX_DAY_LOSS   = -300.0
+# ── MFFU BUILDER ACCOUNT RULES ───────────────────────────────────────────────
+# Builder sim-funded account — MFFUEVBLDR505461067
+# Daily Loss Limit:  -$1,000 soft pause (we treat as hard stop)
+# Max EOD Trailing Drawdown: -$2,000 from peak balance
+# No profit target, no consistency rule, no daily profit cap
+# Max contracts: 40 micros (we use 5 MES = well within limit)
+# Payout path: $500 above $2,100 buffer → request payout (max $2,000/cycle, 5 payouts → live)
+
+MAX_DAY_LOSS      = -1_000.0   # daily loss hard stop
+MAX_DAY_PROFIT    =  99_999.0  # no daily profit cap — set high to disable
+PROFIT_TARGET     =  99_999.0  # no eval target
+EOD_TRAIL_MAX     =  2_000.0   # max EOD trailing drawdown from peak
+PAYOUT_BUFFER     =  2_100.0   # must clear this buffer before requesting payout
+PAYOUT_THRESHOLD  =    500.0   # need $500 above buffer to request payout
 
 # ── TRADE CONFIG ──────────────────────────────────────────────────────────────
 LEG1_CONTRACTS = 3;  LEG1_TP = 200.0;  LEG1_SL = 100.0
@@ -414,7 +423,8 @@ class PropStats:
         self.total_pnl        = 0.0
         self.day_pnl          = 0.0
         self.day_date         = date.today()
-        self.peak_pnl         = 0.0
+        self.eod_peak_pnl     = 0.0   # peak P&L at EOD — floor trails this
+        self.intraday_peak    = 0.0   # highest P&L seen today (for EOD trail calc)
         self.wins             = 0
         self.losses           = 0
         self.tight_mode       = False
@@ -422,6 +432,8 @@ class PropStats:
         self.yesterday_wins   = 0
         self.yesterday_losses = 0
         self.day_trades_log   = []
+        self.payout_count     = 0
+        self.total_withdrawn  = 0.0
 
     def _check_day_reset(self):
         today = date.today()
@@ -429,7 +441,11 @@ class PropStats:
             self.yesterday_pnl    = self.day_pnl
             self.yesterday_wins   = sum(1 for t in self.day_trades_log if t["pnl"] > 0)
             self.yesterday_losses = sum(1 for t in self.day_trades_log if t["pnl"] <= 0)
+            # EOD: update peak with today's closing P&L
+            if self.total_pnl > self.eod_peak_pnl:
+                self.eod_peak_pnl = self.total_pnl
             self.day_pnl        = 0.0
+            self.intraday_peak  = 0.0
             self.day_date       = today
             self.day_trades_log = []
 
@@ -439,6 +455,20 @@ class PropStats:
     @property
     def win_rate(self):
         return self.wins / self.total_trades if self.total_trades else 1.0
+
+    @property
+    def trailing_floor(self) -> float:
+        """EOD trailing drawdown floor — rises with EOD peak, never falls."""
+        return self.eod_peak_pnl - EOD_TRAIL_MAX
+
+    @property
+    def drawdown_remaining(self) -> float:
+        return self.total_pnl - self.trailing_floor
+
+    @property
+    def payout_eligible(self) -> bool:
+        """True when account is $500 above the $2,100 buffer."""
+        return self.total_pnl >= (PAYOUT_BUFFER + PAYOUT_THRESHOLD)
 
     def update_tight_mode(self):
         if self.total_trades >= WIN_RATE_MIN_TRADES:
@@ -458,32 +488,39 @@ class PropStats:
         if pnl > 0: self.wins   += 1
         else:       self.losses += 1
         self.update_tight_mode()
-        if self.total_pnl > self.peak_pnl:
-            self.peak_pnl = self.total_pnl
+        # Track intraday peak for reporting
+        if self.total_pnl > self.intraday_peak:
+            self.intraday_peak = self.total_pnl
         if meta:
             self.day_trades_log.append({**meta, "pnl": pnl})
-        return self.total_pnl <= MAX_DRAWDOWN
+        # Return True if EOD trailing floor breached
+        return self.total_pnl <= self.trailing_floor
 
     def can_trade(self) -> tuple[bool, str]:
         self._check_day_reset()
-        if self.total_pnl  <= MAX_DRAWDOWN:   return False, f"Account drawdown hit (${self.total_pnl:.0f})"
-        if self.day_pnl    >= MAX_DAY_PROFIT:  return False, f"Daily profit cap hit (${self.day_pnl:.0f})"
-        if self.day_pnl    <= MAX_DAY_LOSS:    return False, f"Daily loss limit hit (${self.day_pnl:.0f})"
+        if self.total_pnl <= self.trailing_floor:
+            return False, f"EOD trailing drawdown hit (floor: ${self.trailing_floor:.0f})"
+        if self.day_pnl <= MAX_DAY_LOSS:
+            return False, f"Daily loss limit hit (${self.day_pnl:.0f})"
         return True, "ok"
 
     def status(self):
         return {
-            "total_pnl":            round(self.total_pnl, 2),
-            "day_pnl":              round(self.day_pnl, 2),
-            "peak_pnl":             round(self.peak_pnl, 2),
-            "wins":                 self.wins,
-            "losses":               self.losses,
-            "win_rate":             round(self.win_rate * 100, 1),
-            "total_trades":         self.total_trades,
-            "tight_mode":           self.tight_mode,
-            "day_loss_remaining":   round(MAX_DAY_LOSS   - self.day_pnl, 2),
-            "day_profit_remaining": round(MAX_DAY_PROFIT - self.day_pnl, 2),
-            "yesterday_pnl":        round(self.yesterday_pnl, 2),
+            "total_pnl":          round(self.total_pnl, 2),
+            "day_pnl":            round(self.day_pnl, 2),
+            "eod_peak_pnl":       round(self.eod_peak_pnl, 2),
+            "trailing_floor":     round(self.trailing_floor, 2),
+            "drawdown_remaining": round(self.drawdown_remaining, 2),
+            "day_loss_remaining": round(MAX_DAY_LOSS - self.day_pnl, 2),
+            "wins":               self.wins,
+            "losses":             self.losses,
+            "win_rate":           round(self.win_rate * 100, 1),
+            "total_trades":       self.total_trades,
+            "tight_mode":         self.tight_mode,
+            "payout_eligible":    self.payout_eligible,
+            "payout_count":       self.payout_count,
+            "yesterday_pnl":      round(self.yesterday_pnl, 2),
+            "to_payout":          round(max(0, PAYOUT_BUFFER + PAYOUT_THRESHOLD - self.total_pnl), 2),
         }
 
 stats = PropStats()
@@ -536,6 +573,7 @@ async def report_6am():
     wr_str  = f"{stats.win_rate:.0%} ({stats.wins}W/{stats.losses}L)" if stats.total_trades else "No trades yet"
     allowed, reason = stats.can_trade()
     ts = tuner.status()
+    s = stats.status()
     text = (
         f"☀️ *AlphaGrid Morning Report* — {datetime.now(EST).strftime('%b %d, %Y')}\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -546,8 +584,13 @@ async def report_6am():
         f"📊 *Yesterday* P&L: `${stats.yesterday_pnl:+.2f}` | "
         f"{stats.yesterday_wins + stats.yesterday_losses} trades "
         f"({stats.yesterday_wins}W/{stats.yesterday_losses}L)\n\n"
-        f"🎯 *Account* Total: `${stats.total_pnl:+.2f}` / `$3,000`\n"
-        f"Win Rate: `{wr_str}` | Mode: `{'🔒 TIGHT' if stats.tight_mode else '✅ NORMAL'}`\n\n"
+        f"💼 *Builder Account Status*\n"
+        f"  Total P&L: `${stats.total_pnl:+.2f}`\n"
+        f"  EOD Floor: `${stats.trailing_floor:.0f}` | Drawdown room: `${s['drawdown_remaining']:.0f}`\n"
+        f"  Day loss room: `${s['day_loss_remaining']:.0f}` of `-$1,000`\n"
+        f"  To payout: `${s['to_payout']:.0f}` needed (buffer $2,100 + $500)\n"
+        f"  Payouts: `{stats.payout_count}/5` → live account\n\n"
+        f"📈 *Performance* WR: `{wr_str}` | Mode: `{'🔒 TIGHT' if stats.tight_mode else '✅ NORMAL'}`\n\n"
         f"🧠 *Tuner* Cycle `#{ts['tune_count']}` | Next tune in `{ts['next_tune_in']}` trades\n"
         f"  MES buf: `{ts['sweep_buf']['MES']['normal']}pts` | "
         f"Asia `{ts['session_multiplier']['Asia']:.0%}` "
@@ -561,6 +604,7 @@ async def report_755am():
     lvl_mes = store.get("MES")
     allowed, reason = stats.can_trade()
     ts = tuner.status()
+    s = stats.status()
     text = (
         f"⚡ *Pre-Session Brief* — NY Kill Zone in 5 mins\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -569,7 +613,10 @@ async def report_755am():
         f"AsiaH {fmt_level(lvl_mes['AsiaH'])} AsiaL {fmt_level(lvl_mes['AsiaL'])}\n"
         f"LonH {fmt_level(lvl_mes['LonH'])} LonL {fmt_level(lvl_mes['LonL'])}\n\n"
         f"🛡️ *Kill Conditions*\n"
-        f"  Day P&L: `${stats.day_pnl:+.2f}` | Loss room: `${MAX_DAY_LOSS - stats.day_pnl:.0f}`\n\n"
+        f"  Day P&L: `${stats.day_pnl:+.2f}` | Day loss room: `${s['day_loss_remaining']:.0f}`\n"
+        f"  EOD floor: `${stats.trailing_floor:.0f}` | Drawdown room: `${s['drawdown_remaining']:.0f}`\n\n"
+        f"💰 *Payout Progress*\n"
+        f"  `${s['to_payout']:.0f}` to next payout | `{stats.payout_count}/5` complete\n\n"
         f"🧠 *Active Tuning*\n"
         f"  Buf: `{ts['sweep_buf']['MES']['normal']}pts` | "
         f"NYKZ dir: `{ts['session_direction_bias']['NY_KZ'] or 'BOTH'}` | "
@@ -896,7 +943,18 @@ async def record_result(p: ResultPayload):
 
     await broadcast({"type": "result", "pnl": p.pnl, "stats": s})
     if locked:
-        await send_telegram(f"⛔ *ACCOUNT LOCKED*\nDrawdown: `${stats.total_pnl:.0f}`")
+        await send_telegram(
+            f"⛔ *ACCOUNT LOCKED — EOD Trailing Drawdown Hit*\n"
+            f"Total P&L: `${stats.total_pnl:.0f}` | Floor: `${stats.trailing_floor:.0f}`\n"
+            f"Bot paused — manual reset required."
+        )
+    elif stats.payout_eligible:
+        await send_telegram(
+            f"💰 *PAYOUT ELIGIBLE!*\n"
+            f"Total P&L: `${stats.total_pnl:+.0f}` — above buffer + threshold\n"
+            f"You can request a payout of up to `$2,000` from MFFU.\n"
+            f"Payout #{stats.payout_count + 1} of 5 toward live account."
+        )
     return s
 
 @app.get("/stats")
