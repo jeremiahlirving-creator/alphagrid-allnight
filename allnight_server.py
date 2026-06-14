@@ -625,6 +625,60 @@ async def report_755am():
     )
     await send_telegram(text)
 
+async def report_eod():
+    """4:30 PM ET (1:30 PM PT) — end of day summary after NY session closes."""
+    s      = stats.status()
+    ts     = tuner.status()
+    allowed, reason = stats.can_trade()
+    today_trades = stats.day_trades_log
+    today_wins   = sum(1 for t in today_trades if t["pnl"] > 0)
+    today_losses = sum(1 for t in today_trades if t["pnl"] <= 0)
+    today_pnl    = stats.day_pnl
+    day_emoji    = "🟢" if today_pnl > 0 else "🔴" if today_pnl < 0 else "⚪"
+
+    best_str  = "—"
+    worst_str = "—"
+    if today_trades:
+        best      = max(today_trades, key=lambda t: t["pnl"])
+        worst     = min(today_trades, key=lambda t: t["pnl"])
+        best_str  = f"${best['pnl']:+.0f} ({best.get('inst','?')} {best.get('session','?')})"
+        worst_str = f"${worst['pnl']:+.0f} ({worst.get('inst','?')} {worst.get('session','?')})"
+
+    session_lines = []
+    for sess in ["Asia", "London", "NY_KZ"]:
+        st = [t for t in today_trades if t.get("session") == sess]
+        if st:
+            sw   = sum(1 for t in st if t["pnl"] > 0)
+            spnl = sum(t["pnl"] for t in st)
+            session_lines.append(f"  {sess}: {len(st)} trades {sw}W/${spnl:+.0f}")
+    session_str = "\n".join(session_lines) if session_lines else "  No trades today"
+
+    lines = [
+        f"{day_emoji} *End of Day Report* — {datetime.now(EST).strftime('%b %d, %Y')}",
+        "━━━━━━━━━━━━━━━━━━━━━",
+        "",
+        "📊 *Today*",
+        f"  P&L: `${today_pnl:+.2f}` | {len(today_trades)} trades ({today_wins}W / {today_losses}L)",
+        f"  Best: `{best_str}` | Worst: `{worst_str}`",
+        "",
+        "*By Session:*",
+        session_str,
+        "",
+        "💼 *Account*",
+        f"  Total P&L: `${stats.total_pnl:+.2f}`",
+        f"  EOD Floor: `${stats.trailing_floor:.0f}` | Drawdown room: `${s['drawdown_remaining']:.0f}`",
+        f"  Day loss room: `${s['day_loss_remaining']:.0f}` of -$1,000",
+        f"  To payout: `${s['to_payout']:.0f}` | Payouts: `{stats.payout_count}/5` → live",
+        "",
+        "🧠 *Tuner*",
+        f"  Cycle #{ts['tune_count']} | Next tune in {ts['next_tune_in']} trades",
+        f"  MES buf: {ts['sweep_buf']['MES']['normal']}pts | WR: {s['win_rate']}% ({s['wins']}W/{s['losses']}L)",
+        "",
+        "✅ Account healthy — Asia opens 8PM ET" if allowed else f"🚫 PAUSED — {reason}",
+    ]
+    await send_telegram("\n".join(lines))
+    logger.info("📬 EOD report sent")
+
 async def report_weekly():
     text = tuner.weekly_report()
     await send_telegram(text)
@@ -634,6 +688,7 @@ async def report_weekly():
 async def scheduler():
     sent_6am    = False
     sent_755    = False
+    sent_eod    = False
     sent_weekly = False
     last_date   = date.today()
     while True:
@@ -643,12 +698,14 @@ async def scheduler():
         if today != last_date:
             sent_6am  = False
             sent_755  = False
+            sent_eod  = False
             last_date = today
             store.check_midnight_reset()
         h, m = now.hour, now.minute
         dow  = now.weekday()   # 6 = Sunday
         if h == 6  and m == 0  and not sent_6am:    sent_6am    = True; await report_6am()
         if h == 7  and m == 55 and not sent_755:     sent_755    = True; await report_755am()
+        if h == 16 and m == 30 and not sent_eod:     sent_eod    = True; await report_eod()
         if h == 8  and m == 0  and dow == 6 and not sent_weekly:
             sent_weekly = True; await report_weekly()
 
@@ -972,6 +1029,11 @@ async def send_report_now():
     await report_6am()
     await asyncio.sleep(1)
     await report_755am()
+    return {"ok": True}
+
+@app.post("/report/eod")
+async def send_eod_now():
+    await report_eod()
     return {"ok": True}
 
 @app.post("/report/weekly")
