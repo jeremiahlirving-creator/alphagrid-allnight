@@ -634,3 +634,31 @@ async def ws_ep(ws: WebSocket):
     except WebSocketDisconnect:
         try: ws_clients.remove(ws)
         except: pass
+
+@app.post("/test-trade")
+async def test_trade():
+    """Bypasses session/kill checks — fires real PMT webhook to verify pipeline."""
+    sig = {
+        "id": "TEST001", "inst": "MES", "direction": "BUY",
+        "entry": prices.get("MES", 5416.0), "stop": 5406.0, "tp1": 5431.0,
+        "session": "TEST", "swept": "AsiaL", "tight_mode": False,
+        "ts": datetime.now(EST).strftime("%H:%M ET"),
+    }
+    logger.info("🧪 TEST TRADE firing — bypassing session/kill checks")
+    l1_ok, l2_ok, l1_body, l2_body = await fire_trade_legs(sig)
+    await send_telegram(
+        f"🧪 *TEST TRADE — Pipeline Verification*\n"
+        f"MES BUY @ `{sig['entry']:.2f}`\n"
+        f"{'✅' if l1_ok else '❌'} L1 `{LEG1_CONTRACTS}ct` TP`${LEG1_TP:.0f}` SL`${LEG1_SL:.0f}`: `{l1_body[:80]}`\n"
+        f"{'✅' if l2_ok else '❌'} L2 `{LEG2_CONTRACTS}ct` TP`${LEG2_TP:.0f}` SL`${LEG2_SL:.0f}`: `{l2_body[:80]}`"
+    )
+    return {"ok": l1_ok or l2_ok,
+            "l1_ok": l1_ok, "l1_body": l1_body[:200],
+            "l2_ok": l2_ok, "l2_body": l2_body[:200]}
+
+@app.get("/state")
+async def get_state():
+    """Legacy alias — dashboard compatibility."""
+    allowed, reason = stats.can_trade()
+    return {**stats.status(), "trading_allowed": allowed,
+            "levels": store.all_status(), "prices": prices}
