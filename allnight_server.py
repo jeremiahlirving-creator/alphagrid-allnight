@@ -73,6 +73,128 @@ trades      = []
 ws_clients  = []
 last_signal = {"MES": 0.0, "MNQ": 0.0}
 
+# ── FVG ENGINE ───────────────────────────────────────────────────────────────
+# Two-stage signal: 15M sweep detected → watch 1M bars for FVG → fire on retest
+# FVG (Fair Value Gap): gap between candle[i-2].low and candle[i].high (bullish)
+#                       gap between candle[i-2].high and candle[i].low (bearish)
+# Entry fires when price retraces into the gap zone.
+
+FVG_TIMEOUT_MINS  = 15    # cancel sweep watch if no FVG forms within 15 mins
+FVG_MIN_GAP_PTS   = 1.0   # minimum gap size to qualify as FVG (MES points)
+
+class Bar1M:
+    """Single 1-minute OHLC bar built from tick stream."""
+    def __init__(self, open_p: float, ts: datetime):
+        self.open  = open_p
+        self.high  = open_p
+        self.low   = open_p
+        self.close = open_p
+        self.ts    = ts
+
+    def update(self, price: float):
+        self.high  = max(self.high, price)
+        self.low   = min(self.low,  price)
+        self.close = price
+
+class FVGState:
+    """Tracks sweep detection and FVG watch state per instrument."""
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.sweep_active    = False
+        self.sweep_direction = None   # "BUY" or "SELL"
+        self.sweep_level_key = None   # e.g. "AsiaL"
+        self.sweep_level_val = None   # e.g. 5420.0
+        self.sweep_ts        = None
+        self.sweep_price     = None
+        self.fvg_high        = None   # FVG zone top
+        self.fvg_low         = None   # FVG zone bottom
+        self.fvg_detected    = False
+
+    def activate_sweep(self, direction: str, level_key: str,
+                       level_val: float, price: float, now: datetime):
+        self.reset()
+        self.sweep_active    = True
+        self.sweep_direction = direction
+        self.sweep_level_key = level_key
+        self.sweep_level_val = level_val
+        self.sweep_ts        = now
+        self.sweep_price     = price
+
+    def is_timed_out(self, now: datetime) -> bool:
+        if not self.sweep_ts:
+            return False
+        return (now - self.sweep_ts).total_seconds() > FVG_TIMEOUT_MINS * 60
+
+    def check_fvg(self, bars: list) -> bool:
+        """
+        Check last 3 completed 1M bars for FVG pattern.
+        Bullish FVG (after BUY sweep): bar[-3].low > bar[-1].high
+        Bearish FVG (after SELL sweep): bar[-3].high < bar[-1].low
+        """
+        if len(bars) < 3:
+            return False
+        b0, b1, b2 = bars[-3], bars[-2], bars[-1]
+        if self.sweep_direction == "BUY":
+            gap_low  = b2.high   # top of most recent bar
+            gap_high = b0.low    # bottom of oldest bar
+            if gap_high > gap_low + FVG_MIN_GAP_PTS:
+                self.fvg_low  = gap_low
+                self.fvg_high = gap_high
+                self.fvg_detected = True
+                return True
+        else:
+            gap_high = b2.low
+            gap_low  = b0.high
+            if gap_low < gap_high - FVG_MIN_GAP_PTS:
+                self.fvg_low  = gap_low
+                self.fvg_high = gap_high
+                self.fvg_detected = True
+                return True
+        return False
+
+    def price_in_fvg(self, price: float) -> bool:
+        """Returns True when price retraces into the FVG zone."""
+        if not self.fvg_detected:
+            return False
+        return self.fvg_low <= price <= self.fvg_high
+
+class BarTracker:
+    """Builds 1M OHLC bars from tick stream per instrument."""
+    def __init__(self):
+        self.current: dict[str, Bar1M] = {}
+        self.completed: dict[str, list] = {"MES": [], "MNQ": []}
+        self.last_minute: dict[str, int] = {}
+
+    def update(self, inst: str, price: float, now: datetime) -> bool:
+        """Update tracker. Returns True if a new bar just completed."""
+        minute_key = now.hour * 60 + now.minute
+        new_bar = False
+
+        if inst not in self.current:
+            self.current[inst] = Bar1M(price, now)
+            self.last_minute[inst] = minute_key
+        elif minute_key != self.last_minute.get(inst):
+            # New minute — close current bar, start new one
+            completed = self.current[inst]
+            self.completed[inst].append(completed)
+            if len(self.completed[inst]) > 50:   # keep last 50 bars
+                self.completed[inst] = self.completed[inst][-50:]
+            self.current[inst] = Bar1M(price, now)
+            self.last_minute[inst] = minute_key
+            new_bar = True
+        else:
+            self.current[inst].update(price)
+
+        return new_bar
+
+    def get_bars(self, inst: str) -> list:
+        return self.completed[inst]
+
+bar_tracker = BarTracker()
+fvg_states  = {"MES": FVGState(), "MNQ": FVGState()}
+
 # ── SELF-TUNING ENGINE ────────────────────────────────────────────────────────
 TUNE_EVERY    = 10          # retune after every N trades
 BUF_MIN       = 1.0         # minimum sweep buffer (MES)
@@ -773,82 +895,34 @@ async def fire_trade_legs(sig: dict, session: str) -> tuple[bool, bool, str, str
     return leg1[0], leg2[0], leg1[1], leg2[1]
 
 # ── SIGNAL ENGINE ─────────────────────────────────────────────────────────────
-async def check_signals(inst: str, price: float, now: datetime):
-    session = get_session(now)
-    if not session:
-        return
-
-    cfg    = INSTRUMENTS[inst]
-    levels = store.get(inst)
-    buf    = tuner.get_buf(inst, stats.tight_mode)
-    cooldown = tuner.get_cooldown(session, stats.tight_mode)
-
-    if (now.timestamp() - last_signal[inst]) < cooldown:
-        return
-    if not level_proximity_ok(inst, price):
-        return
-
-    base_lows  = ["AsiaL", "PDL"]
-    base_highs = ["AsiaH", "PDH"]
-    if session == "NY_KZ":
-        base_lows.append("LonL")
-        base_highs.append("LonH")
-
-    direction   = None
-    swept_level = None
-
-    for k in base_lows:
-        lvl = levels.get(k)
-        if lvl and price < lvl - buf:
-            direction, swept_level = "BUY", (k, lvl)
-            break
-
-    if not direction:
-        for k in base_highs:
-            lvl = levels.get(k)
-            if lvl and price > lvl + buf:
-                direction, swept_level = "SELL", (k, lvl)
-                break
-
-    if not direction:
-        return
-
-    # Direction bias filter
-    if not tuner.direction_allowed(session, direction):
-        logger.info(f"🧭 {inst} {direction} suppressed by direction bias in {session}")
-        return
-
-    pv       = cfg["point_value"]
-    qty1     = tuner.get_qty(LEG1_CONTRACTS, session)
-    qty2     = tuner.get_qty(LEG2_CONTRACTS, session)
+async def _execute_signal(inst: str, direction: str, swept_level: tuple,
+                          price: float, session: str, now: datetime,
+                          trigger: str = "SWEEP"):
+    """Execute a confirmed trade signal — shared by sweep and FVG retest paths."""
+    cfg       = INSTRUMENTS[inst]
+    pv        = cfg["point_value"]
+    qty1      = tuner.get_qty(LEG1_CONTRACTS, session)
+    qty2      = tuner.get_qty(LEG2_CONTRACTS, session)
     l1_tp_pts = LEG1_TP / qty1 / pv
     l2_tp_pts = LEG2_TP / qty2 / pv
     sl_pts    = LEG1_SL / qty1 / pv
+    buf       = tuner.get_buf(inst, stats.tight_mode)
 
     if direction == "BUY":
-        stop      = price - sl_pts
-        l1_target = price + l1_tp_pts
-        l2_target = price + l2_tp_pts
-        sl_price  = price - sl_pts
+        stop = price - sl_pts; l1_target = price + l1_tp_pts
+        l2_target = price + l2_tp_pts; sl_price = price - sl_pts
     else:
-        stop      = price + sl_pts
-        l1_target = price - l1_tp_pts
-        l2_target = price - l2_tp_pts
-        sl_price  = price + sl_pts
+        stop = price + sl_pts; l1_target = price - l1_tp_pts
+        l2_target = price - l2_tp_pts; sl_price = price + sl_pts
 
     sig = {
-        "id":         str(uuid.uuid4())[:8],
-        "inst":       inst,
-        "direction":  direction,
-        "entry":      price,
-        "stop":       stop,
-        "leg1_tp":    LEG1_TP, "leg1_sl": LEG1_SL, "leg1_qty": qty1,
-        "leg2_tp":    LEG2_TP, "leg2_sl": LEG2_SL, "leg2_qty": qty2,
-        "contracts":  qty1 + qty2,
-        "session":    session,
-        "swept":      swept_level[0],
-        "tight_mode": stats.tight_mode,
-        "ts":         now.strftime("%H:%M ET"),
+        "id": str(uuid.uuid4())[:8], "inst": inst, "direction": direction,
+        "entry": price, "stop": stop,
+        "leg1_tp": LEG1_TP, "leg1_sl": LEG1_SL, "leg1_qty": qty1,
+        "leg2_tp": LEG2_TP, "leg2_sl": LEG2_SL, "leg2_qty": qty2,
+        "contracts": qty1 + qty2, "session": session,
+        "swept": swept_level[0], "tight_mode": stats.tight_mode,
+        "trigger": trigger, "ts": now.strftime("%H:%M ET"),
     }
     last_signal[inst] = now.timestamp()
 
@@ -858,7 +932,7 @@ async def check_signals(inst: str, price: float, now: datetime):
         await send_telegram(f"🚫 *Signal blocked* — {inst} {direction}\n_{reason}_")
         return
 
-    logger.info(f"🚀 {inst} {direction} @ {price:.2f} | buf={buf} | {session} | Swept {swept_level[0]}")
+    logger.info(f"🚀 {inst} {direction} @ {price:.2f} | {trigger} | {session} | {swept_level[0]}")
     l1_ok, l2_ok, l1_body, l2_body = await fire_trade_legs(sig, session)
 
     if l1_ok or l2_ok:
@@ -869,13 +943,14 @@ async def check_signals(inst: str, price: float, now: datetime):
         mode_tag = "🔒 TIGHT" if stats.tight_mode else "✅ NORMAL"
         wr_str   = f"{stats.win_rate:.0%} ({stats.wins}W/{stats.losses}L)" if stats.total_trades else "—"
         mult     = tuner.session_multiplier.get(session, 1.0)
+        trigger_tag = "🎯 FVG Retest" if trigger == "FVG_RETEST" else "💧 Sweep"
         await send_telegram(
-            f"🤖 *Auto-Trade Fired* [{mode_tag}]\n"
+            f"🤖 *Auto-Trade Fired* [{mode_tag}] {trigger_tag}\n"
             f"`{inst}` {direction} @ `{price:,.2f}`\n\n"
             f"{'✅' if l1_ok else '❌'} *L1* `{qty1}ct` needs `{l1_tp_pts:.1f}pts` → `{l1_target:,.2f}` TP `+${LEG1_TP:.0f}`\n"
             f"{'✅' if l2_ok else '❌'} *L2* `{qty2}ct` needs `{l2_tp_pts:.1f}pts` → `{l2_target:,.2f}` TP `+${LEG2_TP:.0f}` 🏃\n"
             f"🛑 SL `{sl_pts:.1f}pts` → `{sl_price:,.2f}` `-${LEG1_SL:.0f}`\n\n"
-            f"Session: {session} `{mult:.0%}` size | Swept: {swept_level[0]} | Buf: `{buf}pts`\n"
+            f"Session: {session} `{mult:.0%}` | Swept: {swept_level[0]} | Buf: `{buf}pts`\n"
             f"Win Rate: {wr_str} | Day P&L: `${stats.day_pnl:+.0f}`"
         )
         if not l1_ok: logger.error(f"L1 failed [{inst}]: {l1_body}")
@@ -887,12 +962,93 @@ async def check_signals(inst: str, price: float, now: datetime):
             f"L1: `{l1_body[:100]}`\nL2: `{l2_body[:100]}`"
         )
 
+async def check_signals(inst: str, price: float, now: datetime):
+    session = get_session(now)
+    if not session:
+        return
+
+    cfg      = INSTRUMENTS[inst]
+    levels   = store.get(inst)
+    buf      = tuner.get_buf(inst, stats.tight_mode)
+    cooldown = tuner.get_cooldown(session, stats.tight_mode)
+    fvg      = fvg_states[inst]
+    bars     = bar_tracker.get_bars(inst)
+
+    # ── STAGE 2: FVG watch active ─────────────────────────────────────────────
+    if fvg.sweep_active:
+        if fvg.is_timed_out(now):
+            logger.info(f"⏱️ FVG timeout [{inst}] — resetting")
+            fvg.reset()
+        else:
+            # Check for FVG on latest 1M bars
+            if not fvg.fvg_detected and len(bars) >= 3:
+                if fvg.check_fvg(bars):
+                    logger.info(f"📐 FVG [{inst}] {fvg.sweep_direction} zone {fvg.fvg_low:.2f}–{fvg.fvg_high:.2f}")
+                    await send_telegram(
+                        f"📐 *FVG Detected* — {inst} {fvg.sweep_direction}\n"
+                        f"Zone: `{fvg.fvg_low:.2f}` – `{fvg.fvg_high:.2f}`\n"
+                        f"Waiting for price to retest…"
+                    )
+            # Fire when price enters FVG zone
+            if fvg.fvg_detected and fvg.price_in_fvg(price):
+                if (now.timestamp() - last_signal[inst]) >= cooldown:
+                    direction   = fvg.sweep_direction
+                    swept_level = (fvg.sweep_level_key, fvg.sweep_level_val)
+                    fvg.reset()
+                    await _execute_signal(inst, direction, swept_level,
+                                          price, session, now, "FVG_RETEST")
+            return   # Sweep active — don't check for new sweeps
+
+    # ── STAGE 1: Sweep detection ──────────────────────────────────────────────
+    if (now.timestamp() - last_signal[inst]) < cooldown:
+        return
+    if not level_proximity_ok(inst, price):
+        return
+
+    base_lows  = ["AsiaL", "PDL"]
+    base_highs = ["AsiaH"]
+    if session == "NY_KZ":
+        base_lows.append("LonL")
+
+    direction   = None
+    swept_level = None
+
+    for k in base_lows:
+        lvl = levels.get(k)
+        if lvl and price < lvl - buf:
+            direction, swept_level = "BUY", (k, lvl)
+            break
+
+    if not direction and session == "NY_KZ":
+        for k in base_highs:
+            lvl = levels.get(k)
+            if lvl and price > lvl + buf:
+                direction, swept_level = "SELL", (k, lvl)
+                break
+
+    if not direction:
+        return
+
+    if not tuner.direction_allowed(session, direction):
+        logger.info(f"🧭 {inst} {direction} suppressed by bias in {session}")
+        return
+
+    # Activate FVG watch — don't fire yet
+    fvg.activate_sweep(direction, swept_level[0], swept_level[1], price, now)
+    logger.info(f"👁️ Sweep [{inst}] {direction} @ {price:.2f} — watching for FVG")
+    await send_telegram(
+        f"👁️ *Sweep Detected* — {inst} {direction}\n"
+        f"Price `{price:.2f}` swept {swept_level[0]} @ `{swept_level[1]:.2f}`\n"
+        f"Watching 1M bars for FVG… (15 min window)"
+    )
+
 # ── LIFESPAN ──────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     task = asyncio.create_task(scheduler())
     logger.info("AlphaGrid All Night Bot — self-tuning autonomous mode 🧠🤖")
     logger.info("NY KZ: 8:00–8:30 AM ET only (backtest filter v2)")
+    logger.info("FVG engine: 2-stage sweep→FVG→retest (15min timeout)")
     yield
     task.cancel()
 
@@ -912,6 +1068,18 @@ async def health():
         "levels": store.all_status(),
         **stats.status(),
         "tuner": tuner.status(),
+        "fvg": {
+            inst: {
+                "sweep_active":    fvg_states[inst].sweep_active,
+                "sweep_direction": fvg_states[inst].sweep_direction,
+                "sweep_level":     fvg_states[inst].sweep_level_key,
+                "fvg_detected":    fvg_states[inst].fvg_detected,
+                "fvg_low":         fvg_states[inst].fvg_low,
+                "fvg_high":        fvg_states[inst].fvg_high,
+                "bars_buffered":   len(bar_tracker.get_bars(inst)),
+            }
+            for inst in ACTIVE_INSTRUMENTS
+        },
     }
 
 @app.post("/price-update")
@@ -924,9 +1092,12 @@ async def price_update(req: Request):
     prices[inst] = price
     now = datetime.now(EST)
     store.check_midnight_reset()
+    # Update 1M bar tracker — builds OHLC bars from tick stream for FVG detection
+    bar_tracker.update(inst, price, now)
     await check_signals(inst, price, now)
     await broadcast({"type": "price", "inst": inst, "price": price,
-                     "levels": store.get(inst), "stats": stats.status()})
+                     "levels": store.get(inst), "stats": stats.status(),
+                     "fvg_active": fvg_states[inst].sweep_active})
     return {"ok": True, "inst": inst, "price": price}
 
 class HTFPayload(BaseModel):
