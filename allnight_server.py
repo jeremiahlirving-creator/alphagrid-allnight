@@ -339,7 +339,7 @@ async def _send_pmt(inst: str, direction: str, qty: int,
         "dollar_sl":             dollar_sl,
         "multiple_accounts": [{
             "account_id":     TRADOVATE_ACCT,
-            "pmt_account_id": PMT_ACCOUNT,
+            "pmt_account_id": int(PMT_ACCOUNT),
             "quantity":       qty,
         }]
     }
