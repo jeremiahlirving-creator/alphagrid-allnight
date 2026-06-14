@@ -56,7 +56,7 @@ INSTRUMENTS = {
 SESSIONS = {
     "Asia":   (time(20, 0),  time(23, 59)),
     "London": (time(2,  0),  time(5,  0)),
-    "NY_KZ":  (time(8,  0),  time(10, 30)),
+    "NY_KZ":  (time(8,  0),  time(8,  30)),   # Narrowed to 8:00-8:30 AM — backtest shows post-8:30 signals lose
 }
 
 # ── ENV ───────────────────────────────────────────────────────────────────────
@@ -621,7 +621,7 @@ async def report_755am():
         f"  Buf: `{ts['sweep_buf']['MES']['normal']}pts` | "
         f"NYKZ dir: `{ts['session_direction_bias']['NY_KZ'] or 'BOTH'}` | "
         f"Size: `{ts['session_multiplier']['NY_KZ']:.0%}`\n\n"
-        f"{'🟢 BOT LIVE — trading automatically' if allowed else f'🔴 PAUSED — {reason}'}"
+        f"{'🟢 BOT LIVE — NY KZ window: 8:00–8:30 AM ET' if allowed else f'🔴 PAUSED — {reason}'}"
     )
     await send_telegram(text)
 
@@ -892,6 +892,7 @@ async def check_signals(inst: str, price: float, now: datetime):
 async def lifespan(app: FastAPI):
     task = asyncio.create_task(scheduler())
     logger.info("AlphaGrid All Night Bot — self-tuning autonomous mode 🧠🤖")
+    logger.info("NY KZ: 8:00–8:30 AM ET only (backtest filter v2)")
     yield
     task.cancel()
 
