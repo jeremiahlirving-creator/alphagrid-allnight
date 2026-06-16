@@ -836,9 +836,6 @@ async def _send_pmt(inst: str, direction: str, qty: int,
                     dollar_tp: float, dollar_sl: float,
                     suffix: str) -> tuple[bool, str]:
     cfg = INSTRUMENTS[inst]
-    # PMT Total Profit/Loss mode uses per-contract dollar amounts
-    per_contract_tp = round(dollar_tp / qty, 2)
-    per_contract_sl = round(dollar_sl / qty, 2)
     payload = {
         "symbol":                f"{cfg['pmt']}1!",
         "strategy_name":         f"AlphaGrid_{inst}_{suffix}",
@@ -849,9 +846,9 @@ async def _send_pmt(inst: str, direction: str, qty: int,
         "price":                 str(prices.get(inst, 0)),
         "tp":                    0,
         "percentage_tp":         0,
-        "dollar_tp":             per_contract_tp,
+        "dollar_tp":             0,
         "sl":                    0,
-        "dollar_sl":             per_contract_sl,
+        "dollar_sl":             0,
         "percentage_sl":         0,
         "trail":                 0,
         "trail_stop":            0,
