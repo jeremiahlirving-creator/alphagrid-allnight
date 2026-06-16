@@ -1224,9 +1224,15 @@ async def send_weekly_now():
 
 @app.post("/test-trade")
 async def test_trade():
+    # Use live price if available, otherwise fetch from a reasonable default
+    test_price = prices.get("MES", 0)
+    if test_price <= 0:
+        test_price = 7616.0   # fallback to approximate current price
+    # Temporarily set price so SL/TP calculation works
+    prices["MES"] = test_price
     sig = {
         "id": "TEST001", "inst": "MES", "direction": "BUY",
-        "entry": prices.get("MES", 5416.0), "stop": 5406.0,
+        "entry": test_price, "stop": test_price - 6.75,
         "session": "TEST", "swept": "AsiaL", "tight_mode": False,
         "ts": datetime.now(EST).strftime("%H:%M ET"),
     }
@@ -1236,18 +1242,27 @@ async def test_trade():
     l1_tp_pts = LEG1_TP / qty1 / pv
     l2_tp_pts = LEG2_TP / qty2 / pv
     sl_pts    = LEG1_SL / qty1 / pv
-    price = sig["entry"]
-    logger.info("🧪 TEST TRADE firing")
+    sl_price  = round(test_price - sl_pts, 2)
+    l1_tp_price = round(test_price + l1_tp_pts, 2)
+    l2_tp_price = round(test_price + l2_tp_pts, 2)
+    logger.info(f"🧪 TEST TRADE @ {test_price:.2f} | SL={sl_price:.2f} ({sl_pts:.1f}pts) | L1 TP={l1_tp_price:.2f} | L2 TP={l2_tp_price:.2f}")
     l1_ok, l2_ok, l1_body, l2_body = await fire_trade_legs(sig, "NY_KZ")
-    await send_telegram(
+    status = "✅" if l1_ok else "❌"
+    status2 = "✅" if l2_ok else "❌"
+    msg = (
         f"🧪 *TEST TRADE — Pipeline Verification*\n"
-        f"MES BUY @ `{price:,.2f}`\n\n"
-        f"{'✅' if l1_ok else '❌'} L1 `{qty1}ct` needs `{l1_tp_pts:.1f}pts` TP `+${LEG1_TP:.0f}`\n"
-        f"{'✅' if l2_ok else '❌'} L2 `{qty2}ct` needs `{l2_tp_pts:.1f}pts` TP `+${LEG2_TP:.0f}` 🏃\n"
-        f"🛑 SL `{sl_pts:.1f}pts`\n\n"
+        f"MES BUY @ `{test_price:,.2f}`\n\n"
+        f"{status} L1 `{qty1}ct` → TP `{l1_tp_price:.2f}` (+{l1_tp_pts:.1f}pts) SL `{sl_price:.2f}` (-{sl_pts:.1f}pts)\n"
+        f"{status2} L2 `{qty2}ct` → TP `{l2_tp_price:.2f}` (+{l2_tp_pts:.1f}pts) SL `{sl_price:.2f}`\n\n"
         f"L1: `{l1_body[:80]}`\nL2: `{l2_body[:80]}`"
     )
+    await send_telegram(msg)
     return {"ok": l1_ok or l2_ok,
+            "test_price": test_price,
+            "sl_price": sl_price,
+            "sl_pts": sl_pts,
+            "l1_tp": l1_tp_price,
+            "l2_tp": l2_tp_price,
             "l1_ok": l1_ok, "l1_body": l1_body[:200],
             "l2_ok": l2_ok, "l2_body": l2_body[:200]}
 
