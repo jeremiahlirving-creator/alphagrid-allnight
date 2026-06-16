@@ -836,6 +836,15 @@ async def _send_pmt(inst: str, direction: str, qty: int,
                     dollar_tp: float, dollar_sl: float,
                     suffix: str) -> tuple[bool, str]:
     cfg = INSTRUMENTS[inst]
+    pv       = cfg["point_value"]
+    sl_pts   = dollar_sl / qty / pv
+    tp_pts   = dollar_tp / qty / pv
+    if direction.upper() == "BUY":
+        sl_price = round(prices.get(inst, 0) - sl_pts, 2)
+        tp_price = round(prices.get(inst, 0) + tp_pts, 2)
+    else:
+        sl_price = round(prices.get(inst, 0) + sl_pts, 2)
+        tp_price = round(prices.get(inst, 0) - tp_pts, 2)
     payload = {
         "symbol":                f"{cfg['pmt']}1!",
         "strategy_name":         f"AlphaGrid_{inst}_{suffix}",
@@ -844,10 +853,10 @@ async def _send_pmt(inst: str, direction: str, qty: int,
         "quantity":              str(qty),
         "risk_percentage":       0,
         "price":                 str(prices.get(inst, 0)),
-        "tp":                    0,
+        "tp":                    tp_price,
         "percentage_tp":         0,
         "dollar_tp":             0,
-        "sl":                    0,
+        "sl":                    sl_price,
         "dollar_sl":             0,
         "percentage_sl":         0,
         "trail":                 0,
