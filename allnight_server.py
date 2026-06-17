@@ -824,7 +824,12 @@ async def scheduler():
             last_date = today
             store.check_midnight_reset()
         h, m = now.hour, now.minute
-        dow  = now.weekday()   # 6 = Sunday
+        dow  = now.weekday()   # 0=Mon, 6=Sun
+        is_weekday = dow < 5
+
+        if not is_weekday:
+            continue
+
         if h == 6  and m == 0  and not sent_6am:    sent_6am    = True; await report_6am()
         if h == 7  and m == 55 and not sent_755:     sent_755    = True; await report_755am()
         if h == 16 and m == 30 and not sent_eod:     sent_eod    = True; await report_eod()
@@ -1267,12 +1272,14 @@ async def test_trade():
             "l2_ok": l2_ok, "l2_body": l2_body[:200]}
 
 @app.post("/reset_day")
+@app.get("/reset_day")
 async def reset_day():
     stats.day_pnl  = 0.0
     stats.day_date = date.today()
     return {"ok": True}
 
 @app.post("/reset_stats")
+@app.get("/reset_stats")
 async def reset_all_stats():
     stats.__init__()
     return {"ok": True}
