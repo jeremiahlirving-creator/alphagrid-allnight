@@ -494,6 +494,8 @@ class TuningEngine:
 tuner = TuningEngine()
 
 # ── HTF LEVEL STORE ───────────────────────────────────────────────────────────
+LEVELS_FILE = "/tmp/alphagrid_levels.json"
+
 class HTFLevelStore:
     def __init__(self):
         self.levels = {
@@ -504,6 +506,46 @@ class HTFLevelStore:
         }
         self.last_updated = {inst: {} for inst in INSTRUMENTS}
         self._last_reset  = date.today()
+        self._load()   # restore from disk on startup
+
+    def _load(self):
+        """Load persisted levels from disk — survives Railway restarts."""
+        try:
+            import json as _json
+            with open(LEVELS_FILE) as f:
+                data = _json.load(f)
+            saved_date = date.fromisoformat(data.get("date", "2000-01-01"))
+            today = date.today()
+            for inst in INSTRUMENTS:
+                if inst in data.get("levels", {}):
+                    saved = data["levels"][inst]
+                    for k, v in saved.items():
+                        if k in self.levels[inst] and v is not None:
+                            # PDH/PDL persist across days; Asia/London reset daily
+                            if k in ("PDH", "PDL") or saved_date == today:
+                                self.levels[inst][k] = v
+            if data.get("last_updated"):
+                for inst in INSTRUMENTS:
+                    if inst in data["last_updated"]:
+                        self.last_updated[inst] = data["last_updated"][inst]
+            logger.info(f"📂 Levels restored from disk (saved {saved_date})")
+        except FileNotFoundError:
+            logger.info("📂 No saved levels file — starting fresh")
+        except Exception as e:
+            logger.warning(f"📂 Could not load levels: {e}")
+
+    def _save(self):
+        """Persist levels to disk after every update."""
+        try:
+            import json as _json
+            with open(LEVELS_FILE, "w") as f:
+                _json.dump({
+                    "date":         date.today().isoformat(),
+                    "levels":       self.levels,
+                    "last_updated": self.last_updated,
+                }, f)
+        except Exception as e:
+            logger.warning(f"📂 Could not save levels: {e}")
 
     def midnight_reset(self):
         for inst in INSTRUMENTS:
@@ -512,18 +554,24 @@ class HTFLevelStore:
             self.levels[inst]["LonH"]  = None
             self.levels[inst]["LonL"]  = None
         self._last_reset = date.today()
+        self._save()
         logger.info("🔄 Midnight reset — Asia/London levels cleared")
 
     def set(self, inst: str, key: str, value: float, source: str = "auto"):
         self.levels[inst][key] = value
         self.last_updated[inst][key] = {"value": value, "source": source,
                                          "ts": datetime.now(EST).strftime("%H:%M ET")}
+        self._save()
         logger.info(f"📐 {inst} {key} = {value:.2f} [{source}]")
 
     def set_many(self, inst: str, data: dict, source: str):
         for k, v in data.items():
             if v is not None and k in self.levels[inst]:
-                self.set(inst, k, v, source)
+                self.levels[inst][k] = v
+                self.last_updated[inst][k] = {"value": v, "source": source,
+                                               "ts": datetime.now(EST).strftime("%H:%M ET")}
+        self._save()
+        logger.info(f"📐 {inst} levels updated [{source}]: {list(data.keys())}")
 
     def get(self, inst: str) -> dict:
         return self.levels[inst]
