@@ -11,6 +11,15 @@ import aiohttp
 
 load_dotenv()
 
+# Upstash Redis for persistent state across Railway restarts
+try:
+    from upstash import redis_set_json, redis_get_json
+    UPSTASH_ENABLED = True
+except ImportError:
+    UPSTASH_ENABLED = False
+    import logging as _log
+    _log.getLogger("allnight_bot").warning("⚠️ upstash.py not found — levels will not persist")
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 logger = logging.getLogger("allnight_bot")
 
@@ -494,8 +503,6 @@ class TuningEngine:
 tuner = TuningEngine()
 
 # ── HTF LEVEL STORE ───────────────────────────────────────────────────────────
-LEVELS_FILE = "/tmp/alphagrid_levels.json"
-
 class HTFLevelStore:
     def __init__(self):
         self.levels = {
@@ -506,14 +513,15 @@ class HTFLevelStore:
         }
         self.last_updated = {inst: {} for inst in INSTRUMENTS}
         self._last_reset  = date.today()
-        self._load()   # restore from disk on startup
+        # Levels loaded async in lifespan
 
-    def _load(self):
-        """Load persisted levels from disk — survives Railway restarts."""
+    async def _load(self):
+        """Load persisted levels from Upstash Redis — survives Railway restarts."""
         try:
-            import json as _json
-            with open(LEVELS_FILE) as f:
-                data = _json.load(f)
+            data = await redis_get_json("alphagrid:allnight:levels") if UPSTASH_ENABLED else None
+            if not data:
+                logger.info("📂 No saved levels in Redis — starting fresh")
+                return
             saved_date = date.fromisoformat(data.get("date", "2000-01-01"))
             today = date.today()
             for inst in INSTRUMENTS:
@@ -521,56 +529,53 @@ class HTFLevelStore:
                     saved = data["levels"][inst]
                     for k, v in saved.items():
                         if k in self.levels[inst] and v is not None:
-                            # PDH/PDL persist across days; Asia/London reset daily
                             if k in ("PDH", "PDL") or saved_date == today:
                                 self.levels[inst][k] = v
             if data.get("last_updated"):
                 for inst in INSTRUMENTS:
                     if inst in data["last_updated"]:
                         self.last_updated[inst] = data["last_updated"][inst]
-            logger.info(f"📂 Levels restored from disk (saved {saved_date})")
-        except FileNotFoundError:
-            logger.info("📂 No saved levels file — starting fresh")
+            logger.info(f"📂 Levels restored from Redis (saved {saved_date})")
         except Exception as e:
-            logger.warning(f"📂 Could not load levels: {e}")
+            logger.warning(f"📂 Could not load levels from Redis: {e}")
 
-    def _save(self):
-        """Persist levels to disk after every update."""
+    async def _save(self):
+        """Persist levels to Upstash Redis after every update."""
         try:
-            import json as _json
-            with open(LEVELS_FILE, "w") as f:
-                _json.dump({
-                    "date":         date.today().isoformat(),
-                    "levels":       self.levels,
-                    "last_updated": self.last_updated,
-                }, f)
+            if not UPSTASH_ENABLED:
+                return
+            await redis_set_json("alphagrid:allnight:levels", {
+                "date":         date.today().isoformat(),
+                "levels":       self.levels,
+                "last_updated": self.last_updated,
+            })
         except Exception as e:
-            logger.warning(f"📂 Could not save levels: {e}")
+            logger.warning(f"📂 Could not save levels to Redis: {e}")
 
-    def midnight_reset(self):
+    async def midnight_reset(self):
         for inst in INSTRUMENTS:
             self.levels[inst]["AsiaH"] = None
             self.levels[inst]["AsiaL"] = None
             self.levels[inst]["LonH"]  = None
             self.levels[inst]["LonL"]  = None
         self._last_reset = date.today()
-        self._save()
+        await self._save()
         logger.info("🔄 Midnight reset — Asia/London levels cleared")
 
-    def set(self, inst: str, key: str, value: float, source: str = "auto"):
+    async def set(self, inst: str, key: str, value: float, source: str = "auto"):
         self.levels[inst][key] = value
         self.last_updated[inst][key] = {"value": value, "source": source,
                                          "ts": datetime.now(EST).strftime("%H:%M ET")}
-        self._save()
+        await self._save()
         logger.info(f"📐 {inst} {key} = {value:.2f} [{source}]")
 
-    def set_many(self, inst: str, data: dict, source: str):
+    async def set_many(self, inst: str, data: dict, source: str):
         for k, v in data.items():
             if v is not None and k in self.levels[inst]:
                 self.levels[inst][k] = v
                 self.last_updated[inst][k] = {"value": v, "source": source,
                                                "ts": datetime.now(EST).strftime("%H:%M ET")}
-        self._save()
+        await self._save()
         logger.info(f"📐 {inst} levels updated [{source}]: {list(data.keys())}")
 
     def get(self, inst: str) -> dict:
@@ -581,9 +586,9 @@ class HTFLevelStore:
                        "last_updated": self.last_updated[inst]}
                 for inst in INSTRUMENTS}
 
-    def check_midnight_reset(self):
+    async def check_midnight_reset(self):
         if date.today() != self._last_reset:
-            self.midnight_reset()
+            await self.midnight_reset()
 
 store = HTFLevelStore()
 
@@ -870,7 +875,7 @@ async def scheduler():
             sent_755  = False
             sent_eod  = False
             last_date = today
-            store.check_midnight_reset()
+            await store.check_midnight_reset()
         h, m = now.hour, now.minute
         dow  = now.weekday()   # 0=Mon, 6=Sun
         is_weekday = dow < 5
@@ -1107,6 +1112,8 @@ async def check_signals(inst: str, price: float, now: datetime):
 # ── LIFESPAN ──────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Restore levels from Upstash Redis on startup
+    await store._load()
     task = asyncio.create_task(scheduler())
     logger.info("AlphaGrid All Night Bot — self-tuning autonomous mode 🧠🤖")
     logger.info("NY KZ: 8:00–8:30 AM ET only (backtest filter v2)")
@@ -1153,7 +1160,7 @@ async def price_update(req: Request):
         return {"ok": False, "reason": f"{inst} not active"}
     prices[inst] = price
     now = datetime.now(EST)
-    store.check_midnight_reset()
+    await store.check_midnight_reset()
     # Update 1M bar tracker — builds OHLC bars from tick stream for FVG detection
     bar_tracker.update(inst, price, now)
     await check_signals(inst, price, now)
@@ -1180,7 +1187,7 @@ async def levels_auto(p: HTFPayload):
             if getattr(p, k) is not None}
     source = "1H_pine" if "PDH" in data or "PDL" in data else \
              "15M_pine_asia" if "AsiaH" in data else "15M_pine_london"
-    store.set_many(inst, data, source)
+    await store.set_many(inst, data, source)
     await broadcast({"type": "levels", "inst": inst, "levels": store.get(inst)})
     return {"ok": True, "inst": inst, "levels": store.get(inst)}
 
