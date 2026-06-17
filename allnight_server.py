@@ -54,7 +54,7 @@ ACTIVE_INSTRUMENTS = ["MES"]
 # ── INSTRUMENTS ───────────────────────────────────────────────────────────────
 INSTRUMENTS = {
     "MES": {"pmt": "MES", "point_value": 5.0,
-            "sweep_buf_normal": 1.5, "sweep_buf_tight": 2.5,
+            "sweep_buf_normal": 1.0, "sweep_buf_tight": 2.0,
             "level_proximity_tight": 3.0},
     "MNQ": {"pmt": "MNQ", "point_value": 2.0,
             "sweep_buf_normal": 4.0, "sweep_buf_tight": 6.0,
@@ -63,9 +63,9 @@ INSTRUMENTS = {
 
 # ── SESSION WINDOWS (ET) ──────────────────────────────────────────────────────
 SESSIONS = {
-    "Asia":   (time(20, 0),  time(23, 59)),
-    "London": (time(2,  0),  time(5,  0)),
-    "NY_KZ":  (time(8,  0),  time(8,  30)),   # Narrowed to 8:00-8:30 AM — backtest shows post-8:30 signals lose
+    "Asia":   (time(20, 0),  time(23, 59, 59)),
+    "London": (time(2,  0),  time(7,  59)),   # Extended to 8AM ET — covers full London kill zone
+    "NY_KZ":  (time(8,  0),  time(8,  30)),   # NY Kill Zone 8:00-8:30 AM ET
 }
 
 # ── ENV ───────────────────────────────────────────────────────────────────────
@@ -80,7 +80,8 @@ TRADOVATE_ACCT = os.getenv("TRADOVATE_ACCOUNT_ID","MFFUEVBLDR505461067")
 prices      = {"MES": 0.0, "MNQ": 0.0}
 trades      = []
 ws_clients  = []
-last_signal = {"MES": 0.0, "MNQ": 0.0}
+last_signal         = {"MES": 0.0, "MNQ": 0.0}
+last_signal_session = {"MES": None, "MNQ": None}  # reset cooldown on session change
 
 # ── FVG ENGINE ───────────────────────────────────────────────────────────────
 # Two-stage signal: 15M sweep detected → watch 1M bars for FVG → fire on retest
@@ -88,8 +89,8 @@ last_signal = {"MES": 0.0, "MNQ": 0.0}
 #                       gap between candle[i-2].high and candle[i].low (bearish)
 # Entry fires when price retraces into the gap zone.
 
-FVG_TIMEOUT_MINS  = 15    # cancel sweep watch if no FVG forms within 15 mins
-FVG_MIN_GAP_PTS   = 1.0   # minimum gap size to qualify as FVG (MES points)
+FVG_TIMEOUT_MINS  = 30    # cancel sweep watch if no FVG forms within 30 mins
+FVG_MIN_GAP_PTS   = 0.5   # minimum gap size to qualify as FVG (MES points)
 
 class Bar1M:
     """Single 1-minute OHLC bar built from tick stream."""
@@ -241,7 +242,7 @@ class TuningEngine:
 
         # Tunable parameters — start at defaults
         self.sweep_buf = {
-            "MES": {"normal": 1.5, "tight": 2.5},
+            "MES": {"normal": 1.0, "tight": 2.0},
             "MNQ": {"normal": 4.0, "tight": 6.0},
         }
         self.session_multiplier = {
@@ -860,6 +861,10 @@ async def report_weekly():
     logger.info("📬 Weekly report sent")
 
 # ── SCHEDULER ─────────────────────────────────────────────────────────────────
+# Price feed staleness tracking
+last_price_ts:   dict[str, float] = {"MES": 0.0, "MNQ": 0.0}
+last_stale_alert: float = 0.0
+
 async def scheduler():
     sent_6am    = False
     sent_755    = False
@@ -880,14 +885,32 @@ async def scheduler():
         dow  = now.weekday()   # 0=Mon, 6=Sun
         is_weekday = dow < 5
 
+        # Weekly report fires Sunday — check BEFORE weekday guard
+        if h == 8 and m == 0 and dow == 6 and not sent_weekly:
+            sent_weekly = True; await report_weekly()
+
         if not is_weekday:
             continue
 
         if h == 6  and m == 0  and not sent_6am:    sent_6am    = True; await report_6am()
         if h == 7  and m == 55 and not sent_755:     sent_755    = True; await report_755am()
         if h == 16 and m == 30 and not sent_eod:     sent_eod    = True; await report_eod()
-        if h == 8  and m == 0  and dow == 6 and not sent_weekly:
-            sent_weekly = True; await report_weekly()
+
+        # ── PRICE FEED WATCHDOG ───────────────────────────────────────────────
+        # During active sessions, warn if MES price hasn't updated in 2 minutes
+        session = get_session(now)
+        if session and "MES" in ACTIVE_INSTRUMENTS:
+            ts = last_price_ts.get("MES", 0)
+            stale_secs = now.timestamp() - ts if ts > 0 else 9999
+            if stale_secs > 120:
+                if now.timestamp() - last_stale_alert > 600:
+                    last_stale_alert = now.timestamp()
+                    await send_telegram(
+                        f"⚠️ *Price Feed Stale* — All Night Bot\n"
+                        f"No MES price for `{stale_secs/60:.0f}` mins\n"
+                        f"Session: {session} | Check TradingView alerts!"
+                    )
+                    logger.warning(f"⚠️ MES price stale {stale_secs:.0f}s")
 
 # ── PMT WEBHOOK ───────────────────────────────────────────────────────────────
 async def _send_pmt(inst: str, direction: str, qty: int,
@@ -992,6 +1015,7 @@ async def _execute_signal(inst: str, direction: str, swept_level: tuple,
         "trigger": trigger, "ts": now.strftime("%H:%M ET"),
     }
     last_signal[inst] = now.timestamp()
+    session_trade_count[inst][session] = session_trade_count[inst].get(session, 0) + 1
 
     allowed, reason = stats.can_trade()
     if not allowed:
@@ -1067,26 +1091,44 @@ async def check_signals(inst: str, price: float, now: datetime):
             return   # Sweep active — don't check for new sweeps
 
     # ── STAGE 1: Sweep detection ──────────────────────────────────────────────
+    # Reset cooldown and trade count when session changes
+    if last_signal_session[inst] != session:
+        last_signal_session[inst] = session
+        last_signal[inst] = 0.0
+        session_trade_count[inst][session] = 0
+
+    # Max trades per session cap
+    if session_trade_count[inst].get(session, 0) >= MAX_TRADES_PER_SESSION:
+        return
+
     if (now.timestamp() - last_signal[inst]) < cooldown:
         return
     if not level_proximity_ok(inst, price):
         return
 
-    base_lows  = ["AsiaL", "PDL"]
-    base_highs = ["AsiaH"]
-    if session == "NY_KZ":
-        base_lows.append("LonL")
+    # Levels to watch per session — BUY on sweep below lows, SELL on sweep above highs
+    if session == "Asia":
+        base_lows  = ["AsiaL", "PDL"]
+        base_highs = ["AsiaH"]
+    elif session == "London":
+        base_lows  = ["LonL", "AsiaL", "PDL"]
+        base_highs = ["LonH", "AsiaH"]
+    else:  # NY_KZ
+        base_lows  = ["LonL", "AsiaL", "PDL"]
+        base_highs = ["LonH", "AsiaH"]
 
     direction   = None
     swept_level = None
 
+    # Check BUY sweeps (price below low level)
     for k in base_lows:
         lvl = levels.get(k)
         if lvl and price < lvl - buf:
             direction, swept_level = "BUY", (k, lvl)
             break
 
-    if not direction and session == "NY_KZ":
+    # Check SELL sweeps (price above high level)
+    if not direction:
         for k in base_highs:
             lvl = levels.get(k)
             if lvl and price > lvl + buf:
@@ -1159,6 +1201,7 @@ async def price_update(req: Request):
     if inst not in INSTRUMENTS or inst not in ACTIVE_INSTRUMENTS or price <= 0:
         return {"ok": False, "reason": f"{inst} not active"}
     prices[inst] = price
+    last_price_ts[inst] = datetime.now(EST).timestamp()
     now = datetime.now(EST)
     await store.check_midnight_reset()
     # Update 1M bar tracker — builds OHLC bars from tick stream for FVG detection
