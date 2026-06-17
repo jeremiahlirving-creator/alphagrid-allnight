@@ -1176,6 +1176,7 @@ async def health():
         "session": get_session(datetime.now(EST)),
         "tight_mode": stats.tight_mode,
         "prices": prices,
+        "active_instruments": ACTIVE_INSTRUMENTS,
         "levels": store.all_status(),
         **stats.status(),
         "tuner": tuner.status(),
