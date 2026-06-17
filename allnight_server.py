@@ -1198,7 +1198,7 @@ async def set_levels_manual(p: HTFPayload):
         return {"ok": False, "reason": "unknown instrument"}
     data = {k: getattr(p, k) for k in ["PDH","PDL","AsiaH","AsiaL","LonH","LonL"]
             if getattr(p, k) is not None}
-    store.set_many(inst, data, "manual")
+    await store.set_many(inst, data, "manual")
     await broadcast({"type": "levels", "inst": inst, "levels": store.get(inst)})
     return {"ok": True, "levels": store.get(inst)}
 
