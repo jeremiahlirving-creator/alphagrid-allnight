@@ -82,6 +82,8 @@ trades      = []
 ws_clients  = []
 last_signal         = {"MES": 0.0, "MNQ": 0.0}
 last_signal_session = {"MES": None, "MNQ": None}  # reset cooldown on session change
+session_trade_count = {"MES": {}, "MNQ": {}}       # {session: count} — max 2 per session
+MAX_TRADES_PER_SESSION = 2
 
 # ── FVG ENGINE ───────────────────────────────────────────────────────────────
 # Two-stage signal: 15M sweep detected → watch 1M bars for FVG → fire on retest
