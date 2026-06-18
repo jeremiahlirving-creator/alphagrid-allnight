@@ -1197,7 +1197,7 @@ async def health():
 @app.post("/price-update")
 async def price_update(req: Request):
     body  = await req.json()
-    inst  = body.get("ticker", "").upper().replace("1!", "").replace("!", "")
+    inst  = (body.get("ticker") or body.get("symbol") or "").upper().replace("1!", "").replace("!", "")
     price = float(body.get("price", 0))
     if inst not in INSTRUMENTS or inst not in ACTIVE_INSTRUMENTS or price <= 0:
         return {"ok": False, "reason": f"{inst} not active"}
